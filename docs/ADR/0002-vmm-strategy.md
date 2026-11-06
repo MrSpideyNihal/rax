@@ -1,6 +1,6 @@
 # ADR-0002: crosvm spike with QEMU fallback, behind a process boundary
 
-Status: Proposed. Prototype 1 decides.
+Status: Superseded by [ADR-0006](0006-own-rust-vmm.md), 2026-11-06. crosvm was never built.
 
 ## Problem
 

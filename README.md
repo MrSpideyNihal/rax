@@ -5,22 +5,28 @@
 
 **A research project to build the lightest practical Android gaming runtime for Windows, in Rust.**
 
-> **Status: Phase 0 complete. RAX does not run Android yet.** Today it is a host readiness checker and a hypervisor benchmark. The numbers and plans here are honest about that.
+> **Status: Linux boots to a shell on RAX's own VM. RAX does not run Android or Minecraft yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
 
 ## What exists
 
 | Command | What it does |
 |---|---|
 | `rax doctor` | Checks WHP, RAM, CPU, and GPUs, and explains blockers |
-| `rax bench whp` | Boots a tiny guest under the Windows Hypervisor Platform and measures VM-exit and mapping costs |
+| `rax bench whp` | Runs a tiny guest under the Windows Hypervisor Platform and measures VM-exit and mapping costs |
+| `rax vm run` | Boots Linux on RAX's own Rust VMM, with a serial console or an interactive shell |
 
-First result on the target laptop (Ryzen 7 7445HS, Windows 11 Home, VBS on): a guest exit costs a **median of 3.0 µs**, with a worst case of 340 µs. [Raw data and method](docs/BENCHMARKS.md).
+Results on the target laptop (Ryzen 7 7445HS, Windows 11 Home, VBS on):
+
+- A guest exit costs a **median of 3.0 µs**, with a worst case of 340 µs.
+- A tiny Linux 6.18 guest reaches user space in **774 ms on average**, over 10 boots.
+
+A tiny BusyBox guest says little about Android. [Raw data, method and limits](docs/BENCHMARKS.md).
 
 ## What the research found
 
 Read the [feasibility report](docs/FEASIBILITY.md). The short version:
 
-- **The runtime looks buildable.** WHP works, and exit cost is not the bottleneck.
+- **The runtime looks buildable.** WHP works, and exit cost is not the bottleneck. Android and GPU forwarding are the hard parts still ahead.
 - **Google Play is the real obstacle.** It needs a licence from Google, and engineering cannot replace that. RAX will not bundle, spoof or bypass it ([ADR-0005](docs/ADR/0005-google-play-policy.md)).
 - **ARM translation may be avoidable.** Minecraft lists an x86_64 Android build, though that is untested here.
 - **There is no GPU passthrough.** The plan is API forwarding with gfxstream, and we will call it that.
@@ -34,6 +40,13 @@ git clone https://github.com/MrSpideyNihal/rax
 cd rax
 cargo run --release -p rax-cli -- doctor
 cargo run --release -p rax-cli -- bench whp
+```
+
+To boot Linux, download the verified test guest first. It is too large to keep in Git:
+
+```powershell
+./scripts/fetch-guest.ps1
+cargo run --release -p rax-cli -- vm run --shell --kernel guest/vmlinuz-virt --initrd guest/initramfs-virt
 ```
 
 ## Documentation

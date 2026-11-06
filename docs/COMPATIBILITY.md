@@ -6,10 +6,18 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 
 | Host | Status |
 |---|---|
-| Windows 11 Home 26300, Ryzen 7 7445HS, RTX 3050 Laptop + Radeon 740M, VBS on | **Tested**: `rax doctor`, `rax bench whp` |
+| Windows 11 Home 26300, Ryzen 7 7445HS, RTX 3050 Laptop + Radeon 740M, VBS on | **Tested**: `rax doctor`, `rax bench whp`, `rax vm run` |
 | Any other Windows machine | Not tested |
 
 `rax doctor` requires WHP and a hardware Vulkan device. Enable "Windows Hypervisor Platform" in Windows Features, and virtualization in firmware, if it reports a blocker.
+
+## Linux guest
+
+| Item | Status |
+|---|---|
+| Alpine Linux 3.24 `virt` kernel 6.18 to user space | **Tested**, 512 MiB, one vCPU |
+| Interactive shell over serial | **Tested** |
+| Disk, network, multiple vCPUs, graphics | Not implemented |
 
 ## Android guest
 

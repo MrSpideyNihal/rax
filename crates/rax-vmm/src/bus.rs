@@ -1,0 +1,342 @@
+//! Routes guest port I/O to the devices.
+
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+use crate::pic::Pic;
+use crate::pit::Pit;
+use crate::rtc::Rtc;
+use crate::serial::{Serial, Sink};
+
+const IRQ_TIMER: u8 = 0;
+const IRQ_SERIAL: u8 = 4;
+
+const PIC1_COMMAND: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+const PIT_CHANNEL0: u16 = 0x40;
+const PIT_CHANNEL2: u16 = 0x42;
+const PIT_CONTROL: u16 = 0x43;
+const SPEAKER_CONTROL: u16 = 0x61;
+const CMOS_INDEX: u16 = 0x70;
+const CMOS_DATA: u16 = 0x71;
+const KEYBOARD_STATUS: u16 = 0x64;
+const PIC2_COMMAND: u16 = 0xa0;
+const PIC2_DATA: u16 = 0xa1;
+const COM1_START: u16 = 0x3f8;
+const COM1_END: u16 = 0x3ff;
+
+const KEYBOARD_PULSE_RESET: u8 = 0xfe;
+/// What an unclaimed ISA port returns.
+const FLOATING_BUS: u32 = 0xffff_ffff;
+
+/// Counts of guest activity, for reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct IoStats {
+    /// Accesses to the serial port.
+    pub serial: u64,
+    /// Accesses to the PIT.
+    pub timer: u64,
+    /// Accesses to the real-time clock.
+    pub clock: u64,
+    /// Accesses to the PICs.
+    pub interrupt_controller: u64,
+    /// Accesses to ports with no device.
+    pub unclaimed: u64,
+}
+
+/// All devices on the machine.
+pub struct Bus {
+    pic: Pic,
+    slave_pic: Pic,
+    pit: Pit,
+    rtc: Rtc,
+    wall_clock: fn() -> u64,
+    serial: Serial,
+    reset_requested: bool,
+    stats: IoStats,
+    unclaimed_ports: BTreeMap<u16, u64>,
+}
+
+impl Bus {
+    /// Creates the machine's devices.
+    #[must_use]
+    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64) -> Self {
+        Self {
+            pic: Pic::default(),
+            slave_pic: Pic::default(),
+            pit: Pit::default(),
+            rtc: Rtc::default(),
+            wall_clock,
+            serial: Serial::new(console),
+            reset_requested: false,
+            stats: IoStats::default(),
+            unclaimed_ports: BTreeMap::new(),
+        }
+    }
+
+    /// Handles `in`.
+    pub fn read(&mut self, port: u16, size: u8, now_ns: u64) -> u32 {
+        let value = match port {
+            PIC1_COMMAND => {
+                self.stats.interrupt_controller += 1;
+                u32::from(self.pic.read_command())
+            }
+            PIC1_DATA => {
+                self.stats.interrupt_controller += 1;
+                u32::from(self.pic.read_data())
+            }
+            PIC2_COMMAND => {
+                self.stats.interrupt_controller += 1;
+                u32::from(self.slave_pic.read_command())
+            }
+            PIC2_DATA => {
+                self.stats.interrupt_controller += 1;
+                u32::from(self.slave_pic.read_data())
+            }
+            PIT_CHANNEL0 | PIT_CHANNEL2 => {
+                self.stats.timer += 1;
+                u32::from(
+                    self.pit
+                        .read_channel(usize::from(port - PIT_CHANNEL0), now_ns),
+                )
+            }
+            SPEAKER_CONTROL => {
+                self.stats.timer += 1;
+                u32::from(self.pit.read_speaker_control(now_ns))
+            }
+            CMOS_DATA => {
+                self.stats.clock += 1;
+                u32::from(self.rtc.read_data((self.wall_clock)()))
+            }
+            COM1_START..=COM1_END => {
+                self.stats.serial += 1;
+                let byte = self.serial.read(port - COM1_START);
+                self.collect_serial_irq();
+                u32::from(byte)
+            }
+            _ => {
+                self.count_unclaimed(port);
+                FLOATING_BUS
+            }
+        };
+        match size {
+            1 => value & 0xff,
+            2 => value & 0xffff,
+            _ => value,
+        }
+    }
+
+    /// Handles `out`.
+    pub fn write(&mut self, port: u16, value: u32, now_ns: u64) {
+        let byte = value as u8;
+        match port {
+            PIC1_COMMAND => {
+                self.stats.interrupt_controller += 1;
+                self.pic.write_command(byte);
+            }
+            PIC1_DATA => {
+                self.stats.interrupt_controller += 1;
+                self.pic.write_data(byte);
+            }
+            PIC2_COMMAND => {
+                self.stats.interrupt_controller += 1;
+                self.slave_pic.write_command(byte);
+            }
+            PIC2_DATA => {
+                self.stats.interrupt_controller += 1;
+                self.slave_pic.write_data(byte);
+            }
+            PIT_CHANNEL0 | PIT_CHANNEL2 => {
+                self.stats.timer += 1;
+                self.pit
+                    .write_channel(usize::from(port - PIT_CHANNEL0), byte, now_ns);
+            }
+            PIT_CONTROL => {
+                self.stats.timer += 1;
+                self.pit.write_control(byte, now_ns);
+            }
+            SPEAKER_CONTROL => {
+                self.stats.timer += 1;
+                self.pit.write_speaker_control(byte, now_ns);
+            }
+            CMOS_INDEX => {
+                self.stats.clock += 1;
+                self.rtc.write_index(byte);
+            }
+            KEYBOARD_STATUS if byte == KEYBOARD_PULSE_RESET => self.reset_requested = true,
+            COM1_START..=COM1_END => {
+                self.stats.serial += 1;
+                self.serial.write(port - COM1_START, byte);
+                self.collect_serial_irq();
+            }
+            _ => self.count_unclaimed(port),
+        }
+    }
+
+    fn count_unclaimed(&mut self, port: u16) {
+        self.stats.unclaimed += 1;
+        *self.unclaimed_ports.entry(port).or_default() += 1;
+    }
+
+    /// The most-used ports with no device, busiest first.
+    #[must_use]
+    pub fn busiest_unclaimed_ports(&self, limit: usize) -> Vec<(u16, u64)> {
+        let mut ports: Vec<_> = self.unclaimed_ports.iter().map(|(&p, &n)| (p, n)).collect();
+        ports.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        ports.truncate(limit);
+        ports
+    }
+
+    fn collect_serial_irq(&mut self) {
+        if self.serial.take_irq() {
+            self.pic.raise(IRQ_SERIAL);
+        }
+    }
+
+    /// Advances time. Returns true if an interrupt is now waiting.
+    pub fn tick(&mut self, now_ns: u64) -> bool {
+        if self.pit.poll(now_ns) {
+            self.pic.raise(IRQ_TIMER);
+        }
+        self.pic.pending_vector().is_some()
+    }
+
+    /// When the timer next needs attention.
+    #[must_use]
+    pub fn next_timer_ns(&self) -> Option<u64> {
+        self.pit.next_irq_ns()
+    }
+
+    /// Passes host input to the serial port.
+    pub fn console_input(&mut self, bytes: &[u8]) {
+        self.serial.receive(bytes);
+        self.collect_serial_irq();
+    }
+
+    /// The vector to deliver next.
+    #[must_use]
+    pub fn pending_vector(&self) -> Option<u8> {
+        self.pic.pending_vector()
+    }
+
+    /// Records that the pending vector was delivered.
+    pub fn acknowledge_interrupt(&mut self) {
+        self.pic.acknowledge();
+    }
+
+    /// Whether the guest asked for a reset through the keyboard controller.
+    #[must_use]
+    pub fn reset_requested(&self) -> bool {
+        self.reset_requested
+    }
+
+    /// Activity counters.
+    #[must_use]
+    pub fn stats(&self) -> IoStats {
+        self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Sink for Capture {
+        fn put(&mut self, byte: u8) {
+            self.0.lock().unwrap().push(byte);
+        }
+    }
+
+    fn bus() -> (Bus, Capture) {
+        let capture = Capture::default();
+        (Bus::new(Box::new(capture.clone()), || 0), capture)
+    }
+
+    fn init_pic(bus: &mut Bus) {
+        for (port, value) in [
+            (0x20, 0x11),
+            (0x21, 0x30),
+            (0x21, 0x04),
+            (0x21, 0x01),
+            (0x21, 0x00),
+        ] {
+            bus.write(port, value, 0);
+        }
+    }
+
+    #[test]
+    fn serial_output_reaches_the_console() {
+        let (mut bus, capture) = bus();
+        bus.write(0x3f8, u32::from(b'A'), 0);
+        assert_eq!(*capture.0.lock().unwrap(), b"A");
+        assert_eq!(bus.stats().serial, 1);
+    }
+
+    #[test]
+    fn unclaimed_ports_float_high_and_are_counted() {
+        let (mut bus, _) = bus();
+        assert_eq!(bus.read(0x2f8, 1, 0), 0xff);
+        assert_eq!(bus.read(0xcfc, 4, 0), 0xffff_ffff);
+        bus.write(0x80, 0, 0);
+        assert_eq!(bus.stats().unclaimed, 3);
+    }
+
+    #[test]
+    fn busiest_unclaimed_ports_are_ranked() {
+        let (mut bus, _) = bus();
+        bus.write(0x80, 0, 0);
+        bus.write(0x80, 0, 0);
+        bus.read(0x2f8, 1, 0);
+        assert_eq!(
+            bus.busiest_unclaimed_ports(1),
+            vec![(0x80, 2)],
+            "the limit keeps the busiest"
+        );
+    }
+
+    #[test]
+    fn timer_interrupts_flow_through_the_pic() {
+        let (mut bus, _) = bus();
+        init_pic(&mut bus);
+        bus.write(0x43, 0b0011_0100, 0);
+        bus.write(0x40, 0x9c, 0);
+        bus.write(0x40, 0x2e, 0); // 11932 ticks, about 10 ms.
+        assert!(!bus.tick(1_000_000));
+        assert!(bus.tick(11_000_000));
+        assert_eq!(bus.pending_vector(), Some(0x30));
+        bus.acknowledge_interrupt();
+        assert_eq!(bus.pending_vector(), None);
+    }
+
+    #[test]
+    fn console_input_raises_the_serial_irq() {
+        let (mut bus, _) = bus();
+        init_pic(&mut bus);
+        bus.write(0x3f9, 0x01, 0); // Enable RX interrupts.
+        bus.console_input(b"a");
+        assert_eq!(bus.pending_vector(), Some(0x34));
+        assert_eq!(bus.read(0x3f8, 1, 0), u32::from(b'a'));
+    }
+
+    #[test]
+    fn the_clock_never_looks_busy() {
+        let (mut bus, _) = bus();
+        bus.write(0x70, 0x0a, 0);
+        assert_eq!(bus.read(0x71, 1, 0) & 0x80, 0);
+        assert_eq!(bus.stats().unclaimed, 0);
+    }
+
+    #[test]
+    fn keyboard_controller_reset_is_reported() {
+        let (mut bus, _) = bus();
+        bus.write(0x64, 0xaa, 0);
+        assert!(!bus.reset_requested());
+        bus.write(0x64, 0xfe, 0);
+        assert!(bus.reset_requested());
+    }
+}

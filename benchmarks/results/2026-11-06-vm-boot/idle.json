@@ -1,0 +1,11 @@
+{
+    "schema_version":  1,
+    "benchmark":  "vm-idle",
+    "ram_mib":  512,
+    "logical_cpus":  12,
+    "sample_seconds":  10.01,
+    "host_cpu_seconds":  0.219,
+    "percent_of_one_core":  2.18,
+    "working_set_mib":  138.4,
+    "private_memory_mib":  544.5
+}

@@ -13,7 +13,15 @@ Rules:
 ./scripts/run-benchmarks.ps1
 ```
 
-This builds a release binary and writes numbered JSON files to a dated folder under `benchmarks/results`. Record the state of the machine with the results: mains or battery, power plan, and other running applications.
+That covers the hypervisor. For guest boot and idle cost:
+
+```powershell
+./scripts/fetch-guest.ps1
+cargo build --release
+./scripts/measure-boot.ps1 -Passes 10
+```
+
+Each script writes numbered JSON files to a dated folder under `benchmarks/results`. Record the state of the machine with the results: mains or battery, power plan, and other running applications.
 
 ## Results
 
@@ -64,16 +72,70 @@ Limitations:
 - Mapping figures cover **untouched** memory. First-touch fault cost is not measured yet, and it decides real boot and reclaim behaviour.
 - This is not a measurement of Android, graphics, or FPS.
 
+### Linux guest boot and idle, 2026-11-06
+
+| | |
+|---|---|
+| Raw data | [`benchmarks/results/2026-11-06-vm-boot`](../benchmarks/results/2026-11-06-vm-boot) |
+| Command | `./scripts/measure-boot.ps1 -Passes 10` |
+| Build | Release, `x86_64-pc-windows-gnu`, rustc 1.99.1 |
+| Guest | Alpine 3.24 `linux-virt` 6.18.60, 512 MiB, one vCPU, serial console |
+| Host | Same laptop and power plan as above, on mains |
+| State | **Not isolated.** Another application held about 7 GB, and about 1.9 GB of RAM was available |
+
+Boot, from the first vCPU instruction until user space printed its marker:
+
+| | Result |
+|---|---|
+| Passes | 10, all reached user space and powered off |
+| Mean | 774 ms |
+| Range | 757 to 796 ms |
+| vCPU exits per boot | About 36,200, of which 33,344 were serial port accesses |
+| Interrupts per boot | 309 to 333 |
+
+Idle, with a guest sitting at a shell prompt, sampled over 10 s:
+
+| | Result |
+|---|---|
+| Host CPU | 2.18% of one core |
+| Working set of `rax.exe` | 138 MiB |
+| Private memory of `rax.exe` | 544.5 MiB, of which 512 MiB is guest RAM reservation |
+
+Inside the guest, `free -m` reported 34 MiB used of 469 MiB, in one interactive check.
+
+Interpretation:
+
+- Nearly all exits are boot messages on the emulated serial port, so a `quiet` boot should need far fewer. That has not been measured.
+- **Idle CPU misses the 1% target.** The likely cause is the timer thread waking every millisecond, but this has not been profiled.
+- The working set is low because guest RAM is only touched on demand. It will grow with real workloads, so **138 MiB must not be read as RAX's memory cost**.
+
+Limitations:
+
+- This is a tiny BusyBox guest, not Android. **Android will be far slower and larger.**
+- One sampling run for idle. Single vCPU. No disk, network, or graphics.
+
+Boot time history, for the record. These figures came from builds with known bugs and their raw data was discarded:
+
+| Change | Boot | Exits |
+|---|---|---|
+| First working boot | About 3.3 s | About 121,000 |
+| Added RTC. Linux had spun about 80,000 times on a clock it could not read | About 0.8 s | About 36,000 |
+
+### Interrupt delivery bug, found by measurement
+
+The first results showed about 1 boot in 5 losing all user-space output. The first diagnosis, a stale flag, was only a symptom: removing the flag left 5 of 30 boots failing. The root cause was a wrong register number, `0x80000003` instead of `0x80000004`, written from memory, so interrupt-window notifications were never requested. Each blocked interrupt then waited up to 1 ms for the next timer kick.
+
+Exits were not counted before the fix, but a trace showed the window request never clearing in any of 12 boots. After the fix, every boot took 125 to 153 window exits, and 30 of 30 boots kept their output. `crates/rax-vmm/tests/boot_linux.rs` boots real Linux ten times to guard against this. Left unfixed, the same delay could have added input latency in a game.
+
 ## Planned
 
 | Measurement | Phase | Tool |
 |---|---|---|
-| Boot time, VMM RSS | 1 | `rax vm` |
-| Idle RAM and CPU | 1 | Windows performance counters |
+| Android boot time, idle RAM and CPU | 1b | `rax vm` |
 | GLES frame time through gfxstream | 2 | Open test APK, Perfetto |
 | Rendering overhead against the Android Emulator | 2 | Same APK |
 | Input latency | 3 | Timestamped event path |
-| First-touch and reclaim cost | 5 | `rax bench` extension |
+| First-touch page fault and reclaim cost | 5 | `rax bench` extension |
 | Minecraft FPS, 1% low, frame time variance | Gated | Requires a licensed path |
 
 Control baseline note: the Android SDK licence covers use "solely to develop applications", so running a retail game on Google's Play system images as a performance benchmark needs legal review first. The open test APK avoids the question.

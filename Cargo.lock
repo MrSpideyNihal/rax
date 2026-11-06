@@ -37,6 +37,7 @@ name = "rax-cli"
 version = "0.1.0"
 dependencies = [
  "rax-host",
+ "rax-vmm",
  "serde",
  "serde_json",
 ]
@@ -45,6 +46,14 @@ dependencies = [
 name = "rax-host"
 version = "0.1.0"
 dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "rax-vmm"
+version = "0.1.0"
+dependencies = [
+ "rax-host",
  "serde",
 ]
 

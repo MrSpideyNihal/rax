@@ -5,7 +5,8 @@ Each record states the problem, the options, the decision, and the consequences.
 | ADR | Decision | Status |
 |---|---|---|
 | [0001](0001-use-windows-hypervisor-platform.md) | Use the Windows Hypervisor Platform | Accepted |
-| [0002](0002-vmm-strategy.md) | crosvm spike, QEMU fallback, behind a process boundary | Proposed, pending Prototype 1 |
+| [0002](0002-vmm-strategy.md) | crosvm spike, QEMU fallback, behind a process boundary | Superseded by 0006 |
 | [0003](0003-graphics-pipeline.md) | gfxstream on host Vulkan, no passthrough claims | Proposed, pending Phase 2 |
 | [0004](0004-x86-64-guest-first.md) | x86_64 guest, no ARM translation dependency | Accepted |
 | [0005](0005-google-play-policy.md) | Never bundle, fake or bypass Google Play | Accepted |
+| [0006](0006-own-rust-vmm.md) | Write RAX's own VMM in Rust | Accepted |

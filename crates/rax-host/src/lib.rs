@@ -12,6 +12,7 @@ pub mod dylib;
 pub mod error;
 pub mod host;
 pub mod stats;
+pub mod vm;
 pub mod vulkan;
 pub mod whp;
 

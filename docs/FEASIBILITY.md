@@ -2,6 +2,8 @@
 
 Status: complete, as of 2026-11-06.
 
+> **Update, same day.** This report's recommendation to use crosvm was reversed by [ADR-0006](ADR/0006-own-rust-vmm.md), and RAX now has its own VMM. Linux boots to an interactive shell on it. Sections below are kept as written so the reasoning stays visible. Current results are in [BENCHMARKS.md](BENCHMARKS.md).
+
 Every claim below carries one of three labels:
 
 | Label | Meaning |
@@ -19,6 +21,7 @@ Every claim below carries one of three labels:
 | Can a Rust host drive a guest through WHP on the target laptop? | **Yes.** Done, on Windows 11 Home with VBS on. | Measured |
 | Will hypervisor exit cost limit frame rate? | **Unlikely.** About 3 µs per exit. | Measured |
 | Can Android boot under crosvm on WHP? | **Unknown.** Upstream does not test WHP. | Sourced gap |
+| Can RAX boot Linux on its own VMM? | **Yes.** Added after this report. | Measured |
 | Can gfxstream deliver hardware GPU acceleration on Windows? | **Yes in the Android Emulator stack, unproven in crosvm.** | Sourced gap |
 | Can Minecraft run without ARM translation? | **Probably, must be tested.** An x86_64 Android version code exists. | Sourced, with one conflicting report |
 | Can RAX beat BlueStacks on resources? | **Unknown.** Reliable public numbers do not exist. | Open |

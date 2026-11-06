@@ -14,6 +14,8 @@ On a machine with WHP enabled, also run the real-guest tests, which CI cannot:
 
 ```powershell
 cargo test -p rax-host --test whp_smoke -- --ignored
+./scripts/fetch-guest.ps1
+cargo test --release -p rax-vmm --test boot_linux -- --ignored
 ```
 
 ## Rules

@@ -10,11 +10,13 @@ mod commands;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-rax - Android gaming runtime for Windows (Phase 0 tooling)
+rax - Android gaming runtime for Windows (early development)
 
 USAGE:
     rax doctor [--json]
     rax bench whp [--iterations N] [--map-mib N] [--out FILE]
+    rax vm run --kernel FILE --initrd FILE [--ram-mib N] [--timeout-secs N]
+               [--shell] [--report FILE]
     rax --version
     rax --help
 
@@ -22,6 +24,7 @@ COMMANDS:
     doctor     Check whether this PC can host RAX.
                Exit code: 0 ready, 1 error, 2 a blocker was found.
     bench whp  Run a tiny guest and measure hypervisor costs.
+    vm run     Boot a Linux guest on RAX's own VM, with a serial console.
 ";
 
 fn main() -> ExitCode {
