@@ -5,6 +5,8 @@
 mod args;
 
 #[cfg(windows)]
+mod app;
+#[cfg(windows)]
 mod commands;
 
 use std::process::ExitCode;
@@ -13,12 +15,14 @@ const USAGE: &str = "\
 rax - Android gaming runtime for Windows (early development)
 
 USAGE:
+    rax                  Open the launcher
     rax doctor [--json]
     rax bench whp [--iterations N] [--map-mib N] [--out FILE]
     rax vm run --kernel FILE --initrd FILE [--ram-mib N] [--timeout-secs N]
                [--shell] [--disk FILE] [--cmdline TEXT] [--report FILE]
                [--framebuffer WxH] [--screenshot FILE]
     rax input check FILE
+    rax ui preview FILE
     rax --version
     rax --help
 

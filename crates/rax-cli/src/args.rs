@@ -29,6 +29,13 @@ pub enum Command {
         /// Path to the profile.
         profile: String,
     },
+    /// Open the launcher.
+    Launch,
+    /// Save the launcher screen as a BMP.
+    UiPreview {
+        /// Output file.
+        out: String,
+    },
     /// Print usage.
     Help,
     /// Print the version.
@@ -58,13 +65,19 @@ pub struct VmRun {
     pub framebuffer: Option<(u16, u16)>,
     /// File to save the screen to.
     pub screenshot: Option<String>,
+    /// File of timed input for repeatable tests.
+    pub input_script: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
 pub fn parse(args: &[String]) -> Result<Command, String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
-        [] | ["help" | "-h" | "--help"] => Ok(Command::Help),
+        [] => Ok(Command::Launch),
+        ["help" | "-h" | "--help"] => Ok(Command::Help),
+        ["ui", "preview", out] => Ok(Command::UiPreview {
+            out: (*out).to_owned(),
+        }),
         ["version" | "-V" | "--version"] => Ok(Command::Version),
         ["doctor"] => Ok(Command::Doctor { json: false }),
         ["doctor", "--json"] => Ok(Command::Doctor { json: true }),
@@ -111,6 +124,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut cmdline = None;
     let mut framebuffer = None;
     let mut screenshot = None;
+    let mut input_script = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -130,6 +144,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--cmdline" => cmdline = Some((*value).to_owned()),
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
             "--screenshot" => screenshot = Some((*value).to_owned()),
+            "--input-script" => input_script = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -144,6 +159,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         cmdline,
         framebuffer,
         screenshot,
+        input_script,
     }))
 }
 
@@ -172,8 +188,9 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_prints_help() {
-        assert_eq!(run(&[]), Ok(Command::Help));
+    fn no_arguments_opens_the_launcher() {
+        assert_eq!(run(&[]), Ok(Command::Launch));
+        assert_eq!(run(&["--help"]), Ok(Command::Help));
     }
 
     #[test]
@@ -249,6 +266,7 @@ mod tests {
                 cmdline: None,
                 framebuffer: None,
                 screenshot: None,
+                input_script: None,
             }))
         );
     }

@@ -17,6 +17,7 @@ use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
 use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
+use crate::ps2::GuestInput;
 use crate::serial::Sink;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
 
@@ -29,6 +30,8 @@ const BASE_CMDLINE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200 nolapi
 const NO_PCI: &str = " pci=off";
 /// How long the timer thread sleeps when nothing is due sooner.
 const TIMER_IDLE: Duration = Duration::from_millis(1);
+/// How often the screen is copied for a live window.
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 const SMOKE_INIT: &str = "#!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc
@@ -76,6 +79,33 @@ pub struct Config {
     pub framebuffer: Option<Framebuffer>,
     /// Saves the screen to this BMP file when the guest stops.
     pub screenshot: Option<PathBuf>,
+    /// Connects a live window. `None` runs headless.
+    pub display: Option<Display>,
+    /// Timed input, for repeatable tests with no person at the keyboard.
+    pub input_script: Vec<(Duration, GuestInput)>,
+}
+
+/// The link between the VM thread and a window on another thread.
+#[derive(Debug, Clone)]
+pub struct Display {
+    /// The latest frame, copied while the vCPU is stopped.
+    pub frame: Arc<Mutex<Vec<u8>>>,
+    /// Input from the window.
+    pub input: Arc<Mutex<Vec<GuestInput>>>,
+    /// Set to shut the guest down.
+    pub stop: Arc<AtomicBool>,
+}
+
+impl Display {
+    /// Creates a link for a screen of `size_bytes`.
+    #[must_use]
+    pub fn new(size_bytes: usize) -> Self {
+        Self {
+            frame: Arc::new(Mutex::new(vec![0; size_bytes])),
+            input: Arc::new(Mutex::new(Vec::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// How the guest stopped.
@@ -88,6 +118,8 @@ pub enum Outcome {
     Reset,
     /// The configured time ran out.
     TimedOut,
+    /// The host asked the guest to stop.
+    Stopped,
 }
 
 /// What happened during a run.
@@ -170,6 +202,8 @@ struct Shared {
     wake: Condvar,
     stop: AtomicBool,
     started: Instant,
+    display: Option<Display>,
+    input_script: Vec<(Duration, GuestInput)>,
 }
 
 impl Shared {
@@ -179,11 +213,27 @@ impl Shared {
 }
 
 fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<u8>>>) {
+    let mut script_position = 0;
     while !shared.stop.load(Ordering::Relaxed) {
         let now = shared.now_ns();
+        let window_input: Vec<GuestInput> = shared
+            .display
+            .as_ref()
+            .and_then(|display| display.input.lock().ok())
+            .map_or_else(Vec::new, |mut queue| std::mem::take(&mut *queue));
         let Ok(mut bus) = shared.bus.lock() else {
             return;
         };
+        for event in window_input {
+            bus.guest_input(event);
+        }
+        while let Some((at, event)) = shared.input_script.get(script_position) {
+            if u128::from(now) < at.as_nanos() {
+                break;
+            }
+            bus.guest_input(*event);
+            script_position += 1;
+        }
         while let Some(bytes) = input.and_then(|input| input.try_recv().ok()) {
             bus.console_input(&bytes);
         }
@@ -263,8 +313,26 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
     let mut interrupts = 0_u64;
     let mut floating_pages = 0_u64;
     let mut window_exits = 0_u64;
+    let mut last_frame = Instant::now();
     let mut interruptible = false;
     loop {
+        if let Some(display) = &shared.display {
+            if display.stop.load(Ordering::Relaxed) {
+                return Ok(Finished {
+                    outcome: Outcome::Stopped,
+                    exits,
+                    interrupts,
+                    floating_pages,
+                    window_exits,
+                });
+            }
+            if last_frame.elapsed() >= FRAME_INTERVAL {
+                last_frame = Instant::now();
+                if let Ok(mut frame) = display.frame.try_lock() {
+                    vm.read_framebuffer(&mut frame)?;
+                }
+            }
+        }
         if Instant::now() >= deadline {
             return Ok(Finished {
                 outcome: Outcome::TimedOut,
@@ -370,6 +438,16 @@ fn command_line(api: &Api, has_disk: bool) -> String {
     line
 }
 
+/// Tells the kernel the clock rate, which avoids a slow calibration.
+fn with_tsc_rate(api: &Api, mut line: String) -> String {
+    if !line.contains("tsc_early_khz=")
+        && let Some(hz) = vm::tsc_hz(api)
+    {
+        line.push_str(&format!(" tsc_early_khz={}", hz / 1000));
+    }
+    line
+}
+
 fn open_disk(path: &PathBuf) -> Result<VirtioBlk, Box<dyn Error>> {
     let file = OpenOptions::new()
         .read(true)
@@ -399,10 +477,10 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let initrd_gpa = kernel.initrd_address(initrd.len(), ram_bytes)?;
 
     let disk = config.disk.as_ref().map(open_disk).transpose()?;
-    let cmdline = config
-        .own_init_cmdline
-        .clone()
-        .unwrap_or_else(|| command_line(&api, disk.is_some()));
+    let cmdline = match &config.own_init_cmdline {
+        Some(own) => with_tsc_rate(&api, own.clone()),
+        None => command_line(&api, disk.is_some()),
+    };
 
     let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
     if let Some(screen) = config.framebuffer {
@@ -440,6 +518,8 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,
+        display: config.display.clone(),
+        input_script: config.input_script.clone(),
     };
     let kicker = vm.kicker();
     let input = config.shell.then(spawn_stdin_reader);

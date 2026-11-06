@@ -117,7 +117,9 @@ impl Pic {
         self.pending_irq().map(|irq| self.base + irq)
     }
 
-    fn pending_irq(&self) -> Option<u8> {
+    /// The IRQ that would be delivered next.
+    #[must_use]
+    pub fn pending_irq(&self) -> Option<u8> {
         let ready = self.requested & !self.mask;
         if ready == 0 {
             return None;

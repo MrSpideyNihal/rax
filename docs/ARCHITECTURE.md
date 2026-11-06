@@ -43,6 +43,7 @@ flowchart TB
 | `crates/rax-host` | **exists** | OS integration and all current `unsafe`: WHP, Vulkan probing, host facts, readiness rules, statistics |
 | `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT, RTC, PCI and virtio-blk devices, one vCPU. Forbids `unsafe` |
 | `crates/rax-input` | **exists, not connected** | Key-mapping profiles, keyboard and mouse to touch events. Forbids `unsafe` |
+| `crates/rax-ui` | **exists** | The launcher: procedural pixel art, a hand-written 5 by 7 font, no toolkit. Forbids `unsafe` |
 | `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`, `rax input check`. Forbids `unsafe` |
 | Multiple vCPUs, more virtio devices | planned, Phase 1b | Required before Android is usable |
 | Input bridge | planned, Phase 3 | Raw Input to virtio-input |
@@ -81,7 +82,11 @@ A single process with no installed service. The vCPU runs on the main thread, on
 
 ### Display
 
-The guest draws into a linear framebuffer described through `screen_info`, so the kernel's VESA driver needs no device behind it. Android renders in software. `--screenshot` saves the buffer as a BMP, and there is no live window yet. This exists to boot and to see the guest. It is not the gaming graphics path, which remains unsolved.
+The guest draws into a linear framebuffer described through `screen_info`, so the kernel's VESA driver needs no device behind it. Android renders in software. A native Win32 window shows it through GDI, copied while the vCPU is stopped, and `--screenshot` saves it as a BMP. This exists to boot and to see the guest. It is not the gaming graphics path, which remains unsolved.
+
+### Mouse and keyboard
+
+An emulated 8042 with PS/2 keyboard and mouse reaches the guest through port I/O. Windows scancodes are already set 1, so there is no key table. Both devices always exist in the guest, so the host's hardware coming and going cannot disturb them. This gives Android a pointer, and multi-finger touch for key mapping is still to come.
 
 ### Storage
 
