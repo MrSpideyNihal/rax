@@ -146,6 +146,34 @@ Exits were not counted before the fix, but a trace showed the window request nev
 
 The test writes zeros sequentially in 1 MiB blocks, so it says nothing about random I/O, or about how Android's storage workload will behave.
 
+### Android Studio emulator baseline, 2026-11-06
+
+This is the number RAX must beat. **It cannot be compared with the RAX results above, because RAX does not run Android yet.** A tiny Linux guest and Android 14 with Google Play do very different amounts of work.
+
+| | |
+|---|---|
+| Raw data | [`2026-11-06-android-emulator-baseline`](../benchmarks/results/2026-11-06-android-emulator-baseline), [`2026-11-06-android-emulator-settled`](../benchmarks/results/2026-11-06-android-emulator-settled) |
+| Command | `./scripts/measure-android-emulator.ps1 -Avd lf34` |
+| Emulator | Android Emulator 37.1.11.0 on WHPX, no window, cold boot, read-only |
+| Guest | Android 14 `google_apis_playstore` x86_64, 1.5 GB RAM, 4 vCPUs, 1080 x 2400, `hw.gpu.mode=auto` |
+| Host | Same laptop, on mains, about 7 GB of RAM available |
+| Game | None installed |
+
+| Measurement | Result |
+|---|---|
+| Boot until `sys.boot_completed` | 33.1 to 42.7 s, mean 38.0 s, 4 boots |
+| Host working set, all emulator processes | 3.6 GB, 3598 to 3619 MiB |
+| Host private memory | 4.2 GB, 4210 to 4253 MiB |
+| CPU 60 s after boot | 404% to 423% of one core, so **not idle**: all 4 vCPUs were busy |
+| CPU 5 minutes after boot | **56% of one core**, or 4.65% of all cores. One 60 s sample |
+
+Interpretation:
+
+- Always let Android settle before calling it idle. The early figure was about 7 times the settled one.
+- The cause of the post-boot work has not been identified. Google Play services probably contribute, which a trimmed guest would not have to run, but that is unverified.
+- Host memory is well above the 1.5 GB of guest RAM. What accounts for the difference has not been broken down.
+- With no window, this says nothing about rendering or FPS.
+
 ## Planned
 
 | Measurement | Phase | Tool |

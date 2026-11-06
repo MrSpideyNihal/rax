@@ -7,7 +7,7 @@ Each phase ends at a gate. A failed gate stops the plan until the recorded alter
 | **0 Research** | Feasibility report, ADRs, host probe, WHP baseline | WHP guest runs on target hardware | **Done** |
 | **1a Own VMM** | `rax vm run`, Linux on RAX's own VMM | Interactive Linux shell under WHP, boot and idle measured | **Done** |
 | **1b Android guest** | virtio-blk (**done**), multiple vCPUs, a prebuilt Android x86_64 image | Android shell under WHP, idle measured | **In progress** |
-| **2 Graphics** | gfxstream on the RTX 3050, GLES test APK | Hardware rendering confirmed, overhead measured against the Android Emulator | Blocked on 1 |
+| **2 Graphics** | GPU forwarding on the RTX 3050, GLES test APK built with the local NDK | Hardware rendering confirmed, overhead measured against the Android Emulator | Blocked on 1 |
 | **3 Input** | Key-mapping engine (**done**), Raw Input, virtual touch device, capture | Latency measured, mouse look usable in a test app | In progress, connection blocked on 1 |
 | **Decision** | Choose the Play route | Written position from Google, or an explicit decision to remain research | Open |
 | **4 Minecraft** | Compatibility testing | Requires a licensed path from the decision above | Gated |

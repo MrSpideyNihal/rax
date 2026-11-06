@@ -1,0 +1,20 @@
+{
+    "schema_version":  1,
+    "benchmark":  "android-emulator-baseline",
+    "emulator_version":  "Android emulator version 37.1.11.0 (build_id 15917651) (CL:N/A)",
+    "pass":  2,
+    "boot_completed_secs":  34.7,
+    "available_mib_before":  7235,
+    "settle_secs":  60,
+    "sample_secs":  30,
+    "percent_of_one_core":  422.73,
+    "percent_of_all_cores":  35.23,
+    "working_set_mib":  3619,
+    "private_memory_mib":  4239.3,
+    "processes":  [
+                      "crashpad_handler",
+                      "emulator",
+                      "netsimd",
+                      "qemu-system-x86_64-headless"
+                  ]
+}

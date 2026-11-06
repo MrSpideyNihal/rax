@@ -20,7 +20,7 @@ Results on the target laptop (Ryzen 7 7445HS, Windows 11 Home, VBS on):
 - A guest exit costs a **median of 3.0 µs**, with a worst case of 340 µs.
 - A tiny Linux 6.18 guest reaches user space in **774 ms on average**, over 10 boots.
 
-A tiny BusyBox guest says little about Android. [Raw data, method and limits](docs/BENCHMARKS.md).
+A tiny BusyBox guest says little about Android. The baseline to beat is Android Studio's emulator running Android 14 with Google Play: **38 s** to boot, **3.6 GB** of host RAM, and **56% of one core** at idle. RAX cannot be compared with that until it runs Android. [Raw data, method and limits](docs/BENCHMARKS.md).
 
 ## What the research found
 
