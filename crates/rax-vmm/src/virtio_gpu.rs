@@ -568,17 +568,36 @@ pub fn swap_red_blue(pixels: &mut [u8]) {
     }
 }
 
-/// Copies the top left of one image into another of a different size.
-pub fn copy_cropped(source: &[u8], source_width: u32, target: &mut [u8], target_width: u32) {
-    let source_row = source_width as usize * 4;
-    let target_row = target_width as usize * 4;
-    if source_row == 0 || target_row == 0 {
+/// Fits a whole image into another of any size, so a guest that picks its
+/// own resolution still shows all of its screen. Picks the nearest pixel,
+/// which costs one copy per row when the sizes match.
+pub fn copy_scaled(
+    source: &[u8],
+    (from_w, from_h): (u32, u32),
+    target: &mut [u8],
+    (to_w, to_h): (u32, u32),
+) {
+    let (from_w, from_h) = (from_w as usize, from_h as usize);
+    let (to_w, to_h) = (to_w as usize, to_h as usize);
+    if from_w == 0 || from_h == 0 || to_w == 0 || to_h == 0 {
         return;
     }
-    let row = source_row.min(target_row);
-    let rows = source.chunks_exact(source_row);
-    for (from, to) in rows.zip(target.chunks_exact_mut(target_row)) {
-        to[..row].copy_from_slice(&from[..row]);
+    if source.len() < from_w * from_h * 4 {
+        return;
+    }
+    for (row, line) in target.chunks_exact_mut(to_w * 4).take(to_h).enumerate() {
+        let from_row = row * from_h / to_h;
+        let start = from_row * from_w * 4;
+        let input = &source[start..start + from_w * 4];
+        if from_w == to_w {
+            line.copy_from_slice(input);
+            continue;
+        }
+        let pixels = line.as_chunks_mut::<4>().0;
+        for (column, pixel) in pixels.iter_mut().enumerate() {
+            let at = column * from_w / to_w * 4;
+            pixel.copy_from_slice(&input[at..at + 4]);
+        }
     }
 }
 
@@ -1090,17 +1109,37 @@ mod tests {
     }
 
     #[test]
-    fn a_wider_source_is_cropped_row_by_row() {
+    fn a_bigger_screen_shrinks_to_fit_instead_of_being_cut_off() {
         let source = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4];
-        let mut target = [0; 8];
-        copy_cropped(&source, 2, &mut target, 1);
-        assert_eq!(target, [1, 1, 1, 1, 3, 3, 3, 3]);
+        let mut target = [0; 4];
+        copy_scaled(&source, (2, 2), &mut target, (1, 1));
+        assert_eq!(target, [1, 1, 1, 1]);
+        let mut wide = [0; 8];
+        copy_scaled(&source, (2, 2), &mut wide, (2, 1));
+        assert_eq!(wide, [1, 1, 1, 1, 2, 2, 2, 2]);
     }
 
     #[test]
-    fn an_empty_image_copies_nothing() {
+    fn the_bottom_right_pixel_is_reachable() {
+        let source = [1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4];
+        let mut target = [0; 64];
+        copy_scaled(&source, (2, 2), &mut target, (4, 4));
+        assert_eq!(target[60..], [4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn matching_sizes_copy_exactly() {
+        let source = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut target = [0; 8];
+        copy_scaled(&source, (1, 2), &mut target, (1, 2));
+        assert_eq!(target, source);
+    }
+
+    #[test]
+    fn empty_or_short_images_copy_nothing() {
         let mut target = [9; 4];
-        copy_cropped(&[], 0, &mut target, 1);
+        copy_scaled(&[], (0, 0), &mut target, (1, 1));
+        copy_scaled(&[1, 2], (1, 1), &mut target, (1, 1));
         assert_eq!(target, [9; 4]);
     }
 }

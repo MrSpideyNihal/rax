@@ -573,12 +573,13 @@ fn vcpu_loop(
                         && let Some(screen) = gpu.read_screen()
                         && let Ok(mut frame) = display.frame.lock()
                     {
-                        let width = frame.len() / 4 / shared.screen_height.max(1);
-                        virtio_gpu::copy_cropped(
+                        let rows = shared.screen_height.max(1);
+                        let columns = frame.len() / 4 / rows;
+                        virtio_gpu::copy_scaled(
                             &gpu.pixels,
-                            screen.width,
+                            (screen.width, screen.height),
                             &mut frame,
-                            width as u32,
+                            (columns as u32, rows as u32),
                         );
                     }
                 }
@@ -855,11 +856,11 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         match gpu.as_mut() {
             Some(gpu) => {
                 if let Some(shown) = gpu.read_screen() {
-                    virtio_gpu::copy_cropped(
+                    virtio_gpu::copy_scaled(
                         &gpu.pixels,
-                        shown.width,
+                        (shown.width, shown.height),
                         &mut pixels,
-                        u32::from(screen.width),
+                        (u32::from(screen.width), u32::from(screen.height)),
                     );
                 }
             }

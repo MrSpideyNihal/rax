@@ -43,7 +43,23 @@ const RELEASE_SCANCODE: u8 = 0x1d;
 const GAME_MODE_SCANCODE: u8 = 0x58;
 const PROFILES: &str = "profiles";
 const BUILT_IN_PROFILE: &str = include_str!("../../../assets/profiles/example-shooter.json");
-const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, F12 game controls, drop an APK to install";
+const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, F9 Home, F10 Back, F12 game controls, drop an APK to install";
+/// F9 and F10, which stand in for a phone's Home and Back buttons.
+const F9_SCANCODE: u8 = 0x43;
+const F10_SCANCODE: u8 = 0x44;
+/// The keyboard codes Linux reads as `KEY_HOMEPAGE` and `KEY_BACK`, which
+/// Android treats as its Home and Back buttons.
+const ANDROID_HOME: (u8, bool) = (0x32, true);
+const ANDROID_BACK: (u8, bool) = (0x6a, true);
+
+/// Turns the keys RAX reserves into the Android buttons they stand for.
+fn android_key(scancode: u8, extended: bool) -> (u8, bool) {
+    match (scancode, extended) {
+        (F9_SCANCODE, false) => ANDROID_HOME,
+        (F10_SCANCODE, false) => ANDROID_BACK,
+        other => other,
+    }
+}
 
 const ANDROID_CMDLINE: &str = "console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
     tsc=reliable androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
@@ -477,7 +493,10 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                     extended,
                     down,
                     ..
-                } => queued.push(input.key(scancode, extended, down)),
+                } => {
+                    let (scancode, extended) = android_key(scancode, extended);
+                    queued.push(input.key(scancode, extended, down));
+                }
                 _ => {}
             }
         }
@@ -682,6 +701,18 @@ mod tests {
             input.release(),
             [key_up(ALT, false), GuestInput::MouseButtons(0)]
         );
+    }
+
+    #[test]
+    fn f9_and_f10_become_home_and_back() {
+        assert_eq!(android_key(F9_SCANCODE, false), ANDROID_HOME);
+        assert_eq!(android_key(F10_SCANCODE, false), ANDROID_BACK);
+    }
+
+    #[test]
+    fn other_keys_pass_through() {
+        assert_eq!(android_key(0x1e, false), (0x1e, false));
+        assert_eq!(android_key(F9_SCANCODE, true), (F9_SCANCODE, true));
     }
 
     #[test]
