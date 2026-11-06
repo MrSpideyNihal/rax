@@ -10,3 +10,4 @@ Each record states the problem, the options, the decision, and the consequences.
 | [0004](0004-x86-64-guest-first.md) | x86_64 guest, no ARM translation dependency | Accepted |
 | [0005](0005-google-play-policy.md) | Never bundle, fake or bypass Google Play | Accepted |
 | [0006](0006-own-rust-vmm.md) | Write RAX's own VMM in Rust | Accepted |
+| [0007](0007-game-goals-and-input.md) | Free Fire and BGMI goals, and key-mapping rules | Accepted |

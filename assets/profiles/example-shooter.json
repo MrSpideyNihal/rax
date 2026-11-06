@@ -1,0 +1,21 @@
+{
+  "name": "Example shooter layout (positions not tested on any game)",
+  "pointer_toggle": "Alt",
+  "bindings": [
+    {
+      "type": "joystick",
+      "up": "W",
+      "down": "S",
+      "left": "A",
+      "right": "D",
+      "center": { "x": 0.17, "y": 0.72 },
+      "radius": 0.08
+    },
+    { "type": "look", "origin": { "x": 0.65, "y": 0.45 }, "sensitivity": 0.0008, "range": 0.22 },
+    { "type": "button", "button": "Left", "at": { "x": 0.89, "y": 0.62 } },
+    { "type": "button", "button": "Right", "at": { "x": 0.93, "y": 0.42 } },
+    { "type": "key", "key": "R", "at": { "x": 0.78, "y": 0.85 } },
+    { "type": "key", "key": "Space", "at": { "x": 0.93, "y": 0.78 } },
+    { "type": "key", "key": "Ctrl", "at": { "x": 0.84, "y": 0.92 } }
+  ]
+}
