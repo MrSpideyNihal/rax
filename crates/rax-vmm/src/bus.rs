@@ -11,6 +11,7 @@ use crate::ps2::{GuestInput, Ps2, Ps2Irq};
 use crate::rtc::Rtc;
 use crate::serial::{Serial, Sink};
 use crate::virtio_blk::{GuestMemory, VirtioBlk};
+use crate::virtio_net::VirtioNet;
 
 const IRQ_TIMER: u8 = 0;
 const IRQ_KEYBOARD: u8 = 1;
@@ -58,6 +59,10 @@ pub struct IoStats {
     pub disk: u64,
     /// Disk requests completed.
     pub disk_requests: u64,
+    /// Frames delivered to the guest.
+    pub frames_in: u64,
+    /// Frames sent by the guest.
+    pub frames_out: u64,
     /// Accesses to ports with no device.
     pub unclaimed: u64,
 }
@@ -73,6 +78,7 @@ pub struct Bus {
     ps2: Ps2,
     pci: Pci,
     disks: Vec<VirtioBlk>,
+    network: Option<VirtioNet>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -81,7 +87,12 @@ pub struct Bus {
 impl Bus {
     /// Creates the machine's devices.
     #[must_use]
-    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64, disks: Vec<VirtioBlk>) -> Self {
+    pub fn new(
+        console: Box<dyn Sink>,
+        wall_clock: fn() -> u64,
+        disks: Vec<VirtioBlk>,
+        network: Option<VirtioNet>,
+    ) -> Self {
         Self {
             pic: Pic::default(),
             slave_pic: Pic::default(),
@@ -90,8 +101,9 @@ impl Bus {
             wall_clock,
             serial: Serial::new(console),
             ps2: Ps2::default(),
-            pci: Pci::new(disks.len()),
+            pci: Pci::new(disks.len(), network.is_some()),
             disks,
+            network,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
@@ -153,10 +165,16 @@ impl Bus {
                 self.pci.read_data(port - PCI_DATA_START, size)
             }
             _ => match self.pci.virtio_offset(port) {
-                Some((index, offset)) => {
-                    self.stats.disk += 1;
-                    self.disks[index].read(offset, size)
-                }
+                Some((index, offset)) => match self.disks.get_mut(index) {
+                    Some(disk) => {
+                        self.stats.disk += 1;
+                        disk.read(offset, size)
+                    }
+                    None => self
+                        .network
+                        .as_mut()
+                        .map_or(FLOATING_BUS, |card| card.read(offset, size)),
+                },
                 None => {
                     self.count_unclaimed(port);
                     FLOATING_BUS
@@ -230,10 +248,17 @@ impl Bus {
                 self.pci.write_data(port - PCI_DATA_START, size, value);
             }
             _ => match self.pci.virtio_offset(port) {
-                Some((index, offset)) => {
-                    self.stats.disk += 1;
-                    self.disks[index].write(offset, value);
-                }
+                Some((index, offset)) => match self.disks.get_mut(index) {
+                    Some(disk) => {
+                        self.stats.disk += 1;
+                        disk.write(offset, value);
+                    }
+                    None => {
+                        if let Some(card) = self.network.as_mut() {
+                            card.write(offset, value);
+                        }
+                    }
+                },
                 None => self.count_unclaimed(port),
             },
         }
@@ -253,15 +278,20 @@ impl Bus {
         ports
     }
 
-    /// Runs any disk requests the guest has queued. Call after a port write,
+    /// Runs anything the guest has queued for the disks or network. Call
     /// while the vCPU is stopped.
-    pub fn service_disk(&mut self, memory: &dyn GuestMemory) {
+    pub fn service_devices(&mut self, memory: &dyn GuestMemory) {
         let mut raise = false;
         for disk in &mut self.disks {
             disk.service(memory);
             raise |= disk.take_irq();
         }
         self.stats.disk_requests = self.disks.iter().map(VirtioBlk::requests).sum();
+        if let Some(card) = self.network.as_mut() {
+            card.service(memory);
+            raise |= card.take_irq();
+            (self.stats.frames_in, self.stats.frames_out) = card.frame_counts();
+        }
         if raise {
             self.pic.raise(VIRTIO_IRQ);
         }
@@ -359,7 +389,7 @@ mod tests {
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
         (
-            Bus::new(Box::new(capture.clone()), || 0, Vec::new()),
+            Bus::new(Box::new(capture.clone()), || 0, Vec::new(), None),
             capture,
         )
     }

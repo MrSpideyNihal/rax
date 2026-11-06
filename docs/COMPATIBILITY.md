@@ -18,7 +18,8 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 | Alpine Linux 3.24 `virt` kernel 6.18 to user space | **Tested**, 512 MiB, one vCPU |
 | Interactive shell over serial | **Tested** |
 | Disk as `/dev/vda`, legacy virtio-blk over PCI | **Tested**: read and write verified from the host |
-| Network, multiple vCPUs, graphics | Not implemented |
+| Network: DHCP, DNS, TCP, UDP | **Tested**: fetched a live web page |
+| Multiple vCPUs, graphics | Not implemented |
 
 ## Android guest
 
@@ -28,7 +29,10 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 | ART and system apps | **Tested**: `system_server` and the setup wizard run |
 | Mouse and keyboard in Android | **Tested**: a scripted click pressed the setup button |
 | Multi-finger touch and key mapping in Android | Not connected |
-| Network, audio | Not implemented |
+| Internet in Android | **Tested**: Android reported validated Ethernet with no setup, and its WebView loaded an HTTPS site |
+| Download speed | **Not measured** |
+| IPv6, ICMP beyond the router | Not implemented |
+| Audio | Not implemented |
 | Installing an APK by console | **Tested**: `pm install` returned `Success` |
 | Dragging an APK onto the window | Built, **not tested end to end** |
 | Apps and data surviving a shutdown | **Tested**: both survived a reboot on `data.img` |

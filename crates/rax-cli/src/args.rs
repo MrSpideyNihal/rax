@@ -67,6 +67,8 @@ pub struct VmRun {
     pub screenshot: Option<String>,
     /// File of timed input for repeatable tests.
     pub input_script: Option<String>,
+    /// Give the guest a network card.
+    pub network: bool,
 }
 
 /// Parses arguments, excluding the program name.
@@ -125,10 +127,15 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut framebuffer = None;
     let mut screenshot = None;
     let mut input_script = None;
+    let mut network = false;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
             shell = true;
+            continue;
+        }
+        if *option == "--net" {
+            network = true;
             continue;
         }
         let value = rest
@@ -160,6 +167,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         framebuffer,
         screenshot,
         input_script,
+        network,
     }))
 }
 
@@ -267,6 +275,7 @@ mod tests {
                 framebuffer: None,
                 screenshot: None,
                 input_script: None,
+                network: false,
             }))
         );
     }

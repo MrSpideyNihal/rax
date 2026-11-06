@@ -17,6 +17,7 @@ pub mod ps2;
 pub mod rtc;
 pub mod serial;
 pub mod virtio_blk;
+pub mod virtio_net;
 
 #[cfg(windows)]
 pub mod machine;

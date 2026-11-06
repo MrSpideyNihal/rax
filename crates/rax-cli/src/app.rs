@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::apk::{self, InstallResult};
 use rax_host::window::{self, Button, Event, Window};
+use rax_net::host::Network;
 use rax_ui::{Action, Launcher, MEMORY_CHOICES_MIB, SCREEN_CHOICES, Settings, UI_HEIGHT, UI_WIDTH};
 use rax_vmm::framebuffer::Framebuffer;
 use rax_vmm::machine::{self, Config, Display};
@@ -41,7 +42,7 @@ const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, drop 
 
 const ANDROID_CMDLINE: &str = "console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
     tsc=reliable androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
-    androidboot.selinux=permissive nomodeset HWACCEL=0 SRC= DEBUG=";
+    androidboot.selinux=permissive nomodeset HWACCEL=0 VIRT_WIFI=0 SRC= DEBUG=";
 
 fn has_android(root: &Path) -> bool {
     [KERNEL, INITRD, SYSTEM]
@@ -150,6 +151,7 @@ fn android_config(
         own_init_cmdline: Some(format!("{ANDROID_CMDLINE} DATA={data_arg}")),
         framebuffer: None,
         screenshot: None,
+        network: None,
         display: None,
         input_script: Vec::new(),
     })
@@ -276,6 +278,7 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     let mut config = android_config(root, "vdb", disks)?;
     config.ram_mib = MEMORY_CHOICES_MIB[settings.memory];
     config.framebuffer = Some(screen);
+    config.network = Some(Network::start());
     config.display = Some(display.clone());
 
     window.set_title(HINT);
@@ -394,6 +397,13 @@ mod tests {
         input.button(Button::Left, true);
         assert_eq!(input.release(), Some(GuestInput::MouseButtons(0)));
         assert_eq!(input.release(), None);
+    }
+
+    #[test]
+    fn android_uses_plain_ethernet() {
+        // Android connects wired networks by itself. The Android-x86 default
+        // wraps the card as a Wi-Fi network that someone would have to join.
+        assert!(ANDROID_CMDLINE.contains("VIRT_WIFI=0"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ path = "src/main.rs"
 rax-host.workspace = true
 rax-vmm.workspace = true
 rax-input.workspace = true
+rax-net.workspace = true
 rax-ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

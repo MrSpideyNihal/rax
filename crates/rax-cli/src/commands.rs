@@ -234,6 +234,7 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
             .framebuffer
             .map(|(width, height)| Framebuffer { width, height }),
         screenshot: options.screenshot.as_ref().map(PathBuf::from),
+        network: options.network.then(rax_net::host::Network::start),
         display: None,
         input_script: match &options.input_script {
             Some(path) => parse_input_script(&std::fs::read_to_string(path)?)?,

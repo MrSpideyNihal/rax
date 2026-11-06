@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rax_host::vm::{self, Kicker, Vm};
 use rax_host::whp::{Api, VmExit};
+use rax_net::host::Network;
+use rax_net::nat::GUEST_MAC;
 use serde::Serialize;
 
 use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
@@ -20,6 +22,7 @@ use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
 use crate::ps2::GuestInput;
 use crate::serial::Sink;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
+use crate::virtio_net::VirtioNet;
 
 /// Printed by the guest once user space is running.
 const READY_MARKER: &[u8] = b"RAX_GUEST_READY";
@@ -84,6 +87,8 @@ pub struct Config {
     pub framebuffer: Option<Framebuffer>,
     /// Saves the screen to this BMP file when the guest stops.
     pub screenshot: Option<PathBuf>,
+    /// Gives the guest a network card, with internet through this network.
+    pub network: Option<Network>,
     /// Connects a live window. `None` runs headless.
     pub display: Option<Display>,
     /// Timed input, for repeatable tests with no person at the keyboard.
@@ -226,6 +231,16 @@ struct Shared {
     started: Instant,
     display: Option<Display>,
     input_script: Vec<(Duration, GuestInput)>,
+    /// Set when the network has frames waiting for the guest.
+    network_ready: Option<Arc<AtomicBool>>,
+}
+
+impl Shared {
+    fn network_pending(&self) -> bool {
+        self.network_ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Relaxed))
+    }
 }
 
 impl Shared {
@@ -269,7 +284,7 @@ fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<
         let pending = bus.tick(now);
         let next = bus.next_timer_ns();
         drop(bus);
-        if pending {
+        if pending || shared.network_pending() {
             shared.wake.notify_all();
             kicker.kick();
         }
@@ -312,7 +327,8 @@ fn wait_while_halted(shared: &Shared, deadline: Instant) -> Result<(), &'static 
             .as_ref()
             .is_some_and(|display| display.stop.load(Ordering::Relaxed));
         let now = Instant::now();
-        if stopping || now >= deadline || bus.pending_vector().is_some() || bus.reset_requested() {
+        let wake = bus.pending_vector().is_some() || bus.reset_requested();
+        if stopping || now >= deadline || wake || shared.network_pending() {
             return Ok(());
         }
         let wait = deadline.saturating_duration_since(now).min(HALT_POLL);
@@ -395,6 +411,11 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
         }
         {
             let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+            if let Some(ready) = &shared.network_ready
+                && ready.swap(false, Ordering::Relaxed)
+            {
+                bus.service_devices(&RamView(vm));
+            }
             if bus.reset_requested() {
                 return Ok(Finished {
                     outcome: Outcome::Reset,
@@ -432,7 +453,7 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                 let now = shared.now_ns();
                 let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
                 bus.write(port, size, value, now);
-                bus.service_disk(&RamView(vm));
+                bus.service_devices(&RamView(vm));
                 drop(bus);
                 vm.skip_instruction(&info)?;
             }
@@ -527,7 +548,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         .collect::<Result<Vec<_>, _>>()?;
     let cmdline = match &config.own_init_cmdline {
         Some(own) => with_tsc_rate(&api, own.clone()),
-        None => command_line(&api, !disks.is_empty()),
+        None => command_line(&api, !disks.is_empty() || config.network.is_some()),
     };
 
     let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
@@ -563,15 +584,28 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
             .as_ref()
             .map(|display| Arc::clone(&display.console_output)),
     };
+    let network_ready = config
+        .network
+        .as_ref()
+        .map(|network| Arc::clone(&network.ready));
+    let card = config.network.clone().map(|network| {
+        let incoming = Arc::clone(&network.incoming);
+        VirtioNet::new(
+            GUEST_MAC,
+            Box::new(move |frame| network.send_frame(frame)),
+            incoming,
+        )
+    });
     let started = Instant::now();
     let deadline = started + config.timeout;
     let shared = Shared {
-        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds, disks)),
+        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds, disks, card)),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,
         display: config.display.clone(),
         input_script: config.input_script.clone(),
+        network_ready,
     };
     let kicker = vm.kicker();
     let input = config.shell.then(spawn_stdin_reader);

@@ -28,6 +28,8 @@ Each phase ends at a gate. A failed gate stops the plan until the recorded alter
 
 ## Work that needs a person
 
+- Check the licences of everything inside the Android-x86 image before sharing the portable folder. It includes a `com.android.chrome` package, and that must be understood first.
+
 - Contact Google through the GMS partner path. Only the project owner can do this.
 - Read the Minecraft EULA and Google's uncertified-device registration page. Neither could be read automatically.
 - Obtain legal advice before any public binary that goes beyond developer tooling.
