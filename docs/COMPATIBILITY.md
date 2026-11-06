@@ -24,8 +24,12 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 
 | Item | Status |
 |---|---|
-| Android boot | Not started |
-| ART | Not started |
+| Android 9 (Android-x86 9.0-r2) full boot | **Tested**: 2 GB, one vCPU, `sys.boot_completed` set, setup screen drawn |
+| ART and system apps | **Tested**: `system_server` and the setup wizard run |
+| Touch, keyboard, or mouse in Android | Not implemented |
+| Network, audio | Not implemented |
+| Installing or running an app of our own | Not tested |
+| Software rendering | **Tested**, for booting only. Never a gaming path |
 | Hardware OpenGL ES | Not started |
 | Hardware Vulkan | Not started |
 

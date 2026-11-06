@@ -29,7 +29,7 @@ Measured on the target laptop on the day of the decision: Linux 6.18 reaches use
 Being honest about the limits of "the repo alone":
 
 - **The guest OS is still downloaded.** Linux and Android are far too large for a Git repository. `scripts/fetch-guest.ps1` fetches them and verifies pinned hashes.
-- **It still contains no virtio devices, disk, network, or SMP.** These are required for Android, and they are substantial work.
+- **It still lacks network, input, and multiple vCPUs.** Disk and a basic display were added later, and Android 9 boots.
 - **Graphics remains the hard part.** A VMM alone cannot replace gfxstream or an equivalent GPU forwarding stack. Whether that can be linked into RAX, and with what toolchain, is open. Rewriting it is not realistic.
 - **Bugs are ours.** The first boots exposed a wrong register number written from memory, which upstream projects would have spared us.
 

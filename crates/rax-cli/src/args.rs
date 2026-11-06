@@ -52,6 +52,12 @@ pub struct VmRun {
     pub report: Option<String>,
     /// Raw disk image for the guest.
     pub disk: Option<String>,
+    /// Boot the guest's own init with this command line.
+    pub cmdline: Option<String>,
+    /// Screen size, as `(width, height)`.
+    pub framebuffer: Option<(u16, u16)>,
+    /// File to save the screen to.
+    pub screenshot: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
@@ -102,6 +108,9 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut shell = false;
     let mut report = None;
     let mut disk = None;
+    let mut cmdline = None;
+    let mut framebuffer = None;
+    let mut screenshot = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -118,6 +127,9 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--timeout-secs" => timeout_secs = positive(option, value)?,
             "--report" => report = Some((*value).to_owned()),
             "--disk" => disk = Some((*value).to_owned()),
+            "--cmdline" => cmdline = Some((*value).to_owned()),
+            "--framebuffer" => framebuffer = Some(screen_size(value)?),
+            "--screenshot" => screenshot = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -129,7 +141,18 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         shell,
         report,
         disk,
+        cmdline,
+        framebuffer,
+        screenshot,
     }))
+}
+
+fn screen_size(value: &str) -> Result<(u16, u16), String> {
+    value
+        .split_once('x')
+        .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+        .filter(|&(width, height)| width > 0 && height > 0)
+        .ok_or_else(|| format!("--framebuffer needs a size like 1280x720, got {value}"))
 }
 
 fn positive(option: &str, value: &str) -> Result<usize, String> {
@@ -223,6 +246,9 @@ mod tests {
                 shell: true,
                 report: None,
                 disk: None,
+                cmdline: None,
+                framebuffer: None,
+                screenshot: None,
             }))
         );
     }
@@ -236,6 +262,14 @@ mod tests {
             })
         );
         assert!(run(&["input", "check"]).is_err());
+    }
+
+    #[test]
+    fn screen_sizes_parse() {
+        assert_eq!(screen_size("1280x720"), Ok((1280, 720)));
+        for bad in ["1280", "0x720", "ax720", "70000x1", "1280x"] {
+            assert!(screen_size(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

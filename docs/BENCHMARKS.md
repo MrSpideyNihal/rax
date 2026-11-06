@@ -174,6 +174,47 @@ Interpretation:
 - Host memory is well above the 1.5 GB of guest RAM. What accounts for the difference has not been broken down.
 - With no window, this says nothing about rendering or FPS.
 
+### Android on RAX, 2026-11-06
+
+![Android setup screen on RAX](images/android-first-boot.png)
+
+The screenshot was saved by `--screenshot` from guest memory.
+
+| | |
+|---|---|
+| Raw data | [`benchmarks/results/2026-11-06-android-rax`](../benchmarks/results/2026-11-06-android-rax) |
+| Commands | `sh scripts/android-boot-time.sh SESSION 3 2048`, then `./scripts/measure-android-rax.ps1 -Session SESSION` |
+| Guest | Android-x86 9.0-r2, 2 GB RAM, 1 vCPU, 1280 x 720 framebuffer, software rendering, no Google apps |
+| Host | Same laptop, on mains, about 6.5 GB of RAM available |
+
+| Measurement | Result |
+|---|---|
+| Boot until `sys.boot_completed` | 52, 53 and 56 s, timed by the guest |
+| vCPU exits per boot | About 390,000 |
+| Host working set, idle | 2056 MiB |
+| Host private memory, idle | 2066 MiB, for 2048 MiB of guest RAM |
+| CPU, settled over 5 minutes | 7.26% of one core. One 60 s sample |
+
+### RAX beside the Android Studio emulator
+
+| | RAX | Android Studio emulator |
+|---|---|---|
+| Android version | 9, from 2020 | 14 |
+| Google Play services | No | Yes |
+| vCPUs | 1 | 4 |
+| Guest RAM | 2 GB | 1.5 GB |
+| Boot | 54 s | 38 s |
+| Host RAM, idle | 2.0 GB | 3.6 GB |
+| CPU, settled | 7.3% of one core | 56% of one core |
+
+**This is not a fair race, and it does not show that RAX is lighter.** Android 9 without Google Play services does much less than Android 14 with them, and RAX has no GPU path yet. Adding those will raise RAX's numbers. Neither column involves a game.
+
+What it does show:
+
+- RAX's own overhead is small: about 18 MiB of private memory above guest RAM, though no GPU forwarding is included.
+- RAX boots slower, using one vCPU. That result is against RAX, and more vCPUs should help.
+- The guest's RAM is all touched by the time it is idle, so guest size sets the host cost. Testing smaller guests and returning free memory are the obvious next steps.
+
 ## Planned
 
 | Measurement | Phase | Tool |
