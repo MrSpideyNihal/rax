@@ -188,6 +188,7 @@ fn android_config(
         own_init_cmdline: Some(android_cmdline(data_arg, false)),
         framebuffer: None,
         gpu: None,
+        balloon: false,
         screenshot: None,
         network: None,
         touchscreen: false,

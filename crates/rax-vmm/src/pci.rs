@@ -52,6 +52,10 @@ const CLASS_OTHER_INPUT: u16 = 0x0980;
 const DEVICE_VIRTIO_GPU: u16 = 0x1050;
 const SUBSYSTEM_VIRTIO_GPU: u16 = 0x0100;
 const CLASS_OTHER_DISPLAY: u16 = 0x0380;
+/// Modern virtio balloon, 0x1040 plus its type of 5.
+const DEVICE_VIRTIO_BALLOON: u16 = 0x1045;
+const SUBSYSTEM_VIRTIO_BALLOON: u16 = 0x0100;
+const CLASS_OTHER: u16 = 0x00ff;
 const REVISION_MODERN: u8 = 1;
 const CFG_COMMON: u8 = 1;
 const CFG_NOTIFY: u8 = 2;
@@ -61,6 +65,8 @@ const CFG_DEVICE: u8 = 4;
 const INPUT_BAR_DEFAULT: u32 = 0xfe00_0000;
 /// Where the GPU's registers sit, right after the touchscreen's.
 const GPU_BAR_DEFAULT: u32 = INPUT_BAR_DEFAULT + BAR_SIZE;
+/// Where the balloon's registers sit, right after the GPU's.
+const BALLOON_BAR_DEFAULT: u32 = GPU_BAR_DEFAULT + BAR_SIZE;
 const BAR_IO_SPACE: u32 = 0x0001;
 /// Size of the virtio register window, in I/O ports.
 const VIRTIO_BAR_SIZE: u32 = 0x40;
@@ -93,6 +99,7 @@ enum Kind {
     Net,
     Input,
     Gpu,
+    Balloon,
 }
 
 /// Builds the capability list that locates a modern device's registers.
@@ -133,17 +140,18 @@ fn virtio_header(index: usize, kind: Kind) -> [u8; HEADER_SIZE] {
             CLASS_OTHER_INPUT,
         ),
         Kind::Gpu => (DEVICE_VIRTIO_GPU, SUBSYSTEM_VIRTIO_GPU, CLASS_OTHER_DISPLAY),
+        Kind::Balloon => (DEVICE_VIRTIO_BALLOON, SUBSYSTEM_VIRTIO_BALLOON, CLASS_OTHER),
     };
     let mut header = [0; HEADER_SIZE];
     put_u16(&mut header, REG_VENDOR, VENDOR_VIRTIO);
     put_u16(&mut header, REG_DEVICE, device);
     header[REG_REVISION] = REVISION_LEGACY;
     put_u16(&mut header, REG_CLASS, class);
-    if matches!(kind, Kind::Input | Kind::Gpu) {
-        let bar = if kind == Kind::Gpu {
-            GPU_BAR_DEFAULT
-        } else {
-            INPUT_BAR_DEFAULT
+    if matches!(kind, Kind::Input | Kind::Gpu | Kind::Balloon) {
+        let bar = match kind {
+            Kind::Gpu => GPU_BAR_DEFAULT,
+            Kind::Balloon => BALLOON_BAR_DEFAULT,
+            _ => INPUT_BAR_DEFAULT,
         };
         header[REG_REVISION] = REVISION_MODERN;
         put_u32(&mut header, REG_BAR0, bar);
@@ -170,20 +178,25 @@ pub struct Pci {
     input: Option<usize>,
     /// Index in `virtio` of the GPU, if any.
     gpu: Option<usize>,
+    /// Index in `virtio` of the balloon, if any.
+    balloon: Option<usize>,
 }
 
 impl Pci {
     /// Creates the bus with one virtio device per disk, then the network
-    /// card, touchscreen and GPU if there are any.
+    /// card, touchscreen, GPU and balloon if there are any.
     #[must_use]
-    pub fn new(disks: usize, network: bool, touch: bool, gpu: bool) -> Self {
+    pub fn new(disks: usize, network: bool, touch: bool, gpu: bool, balloon: bool) -> Self {
         let kinds = (0..disks)
             .map(|_| Kind::Block)
             .chain(network.then_some(Kind::Net))
             .chain(touch.then_some(Kind::Input))
-            .chain(gpu.then_some(Kind::Gpu));
+            .chain(gpu.then_some(Kind::Gpu))
+            .chain(balloon.then_some(Kind::Balloon));
         let input = touch.then_some(disks + usize::from(network));
-        let gpu = gpu.then_some(disks + usize::from(network) + usize::from(touch));
+        let before_gpu = disks + usize::from(network) + usize::from(touch);
+        let balloon = balloon.then_some(before_gpu + usize::from(gpu));
+        let gpu = gpu.then_some(before_gpu);
         Self {
             address: 0,
             host_bridge: host_bridge_header(),
@@ -193,6 +206,7 @@ impl Pci {
                 .collect(),
             input,
             gpu,
+            balloon,
         }
     }
 
@@ -268,7 +282,7 @@ impl Pci {
     }
 
     fn is_modern(&self, index: usize) -> bool {
-        self.input == Some(index) || self.gpu == Some(index)
+        [self.input, self.gpu, self.balloon].contains(&Some(index))
     }
 
     /// Finds the register a memory address hits on a modern device. Addresses
@@ -299,6 +313,12 @@ impl Pci {
     #[must_use]
     pub fn gpu_offset(&self, gpa: u64) -> Option<u64> {
         self.modern_offset(self.gpu, gpa)
+    }
+
+    /// Finds the balloon register a memory address belongs to.
+    #[must_use]
+    pub fn balloon_offset(&self, gpa: u64) -> Option<u64> {
+        self.modern_offset(self.balloon, gpa)
     }
 
     /// Finds the disk and register a port belongs to. Ports decode only
@@ -343,21 +363,21 @@ mod tests {
 
     #[test]
     fn address_port_reads_back_for_the_kernel_probe() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         pci.write_address(0x8000_0000);
         assert_eq!(pci.read_address(), 0x8000_0000);
     }
 
     #[test]
     fn the_host_bridge_identifies_itself() {
-        let mut pci = Pci::new(0, false, false, false);
+        let mut pci = Pci::new(0, false, false, false, false);
         assert_eq!(read(&mut pci, 0, 0, 2), u32::from(VENDOR_REDHAT));
         assert_eq!(read(&mut pci, 0, 0x0a, 2), u32::from(CLASS_HOST_BRIDGE));
     }
 
     #[test]
     fn virtio_identifies_as_a_legacy_block_device() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         assert_eq!(
             read(&mut pci, 1, 0, 4),
             u32::from(DEVICE_VIRTIO_BLK) << 16 | u32::from(VENDOR_VIRTIO)
@@ -370,15 +390,15 @@ mod tests {
 
     #[test]
     fn empty_slots_read_all_ones() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         assert_eq!(read(&mut pci, 2, 0, 4), u32::MAX);
-        let mut without_disk = Pci::new(0, false, false, false);
+        let mut without_disk = Pci::new(0, false, false, false, false);
         assert_eq!(read(&mut without_disk, 1, 0, 4), u32::MAX);
     }
 
     #[test]
     fn other_buses_and_functions_are_empty() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         pci.write_address(ENABLE_BIT | 1 << 16);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
         pci.write_address(ENABLE_BIT | 1 << 8);
@@ -387,21 +407,21 @@ mod tests {
 
     #[test]
     fn a_disabled_address_reads_nothing() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         pci.write_address(0);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
     }
 
     #[test]
     fn bar_sizing_reports_the_window_size() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         write(&mut pci, 1, 0x10, 4, u32::MAX);
         assert_eq!(read(&mut pci, 1, 0x10, 4), 0xffff_ffc1);
     }
 
     #[test]
     fn registers_decode_only_after_io_is_enabled() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         assert_eq!(pci.virtio_offset(0xc040), None);
         write(&mut pci, 1, 0x04, 2, 1);
         assert_eq!(pci.virtio_offset(0xc040), Some((0, 0)));
@@ -412,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_moved_bar_moves_the_window() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         write(&mut pci, 1, 0x04, 2, 1);
         write(&mut pci, 1, 0x10, 4, 0xd000);
         assert_eq!(pci.virtio_offset(0xd010), Some((0, 0x10)));
@@ -421,7 +441,7 @@ mod tests {
 
     #[test]
     fn each_disk_gets_its_own_slot_and_window() {
-        let mut pci = Pci::new(2, false, false, false);
+        let mut pci = Pci::new(2, false, false, false, false);
         assert_eq!(read(&mut pci, 2, 0, 2), u32::from(VENDOR_VIRTIO));
         assert_eq!(read(&mut pci, 3, 0, 4), u32::MAX);
         write(&mut pci, 1, 0x04, 2, 1);
@@ -432,7 +452,7 @@ mod tests {
 
     #[test]
     fn the_touchscreen_is_modern_and_has_capabilities() {
-        let mut pci = Pci::new(0, false, true, false);
+        let mut pci = Pci::new(0, false, true, false, false);
         assert_eq!(read(&mut pci, 1, 0x02, 2), u32::from(DEVICE_VIRTIO_INPUT));
         assert_eq!(read(&mut pci, 1, 0x08, 1), u32::from(REVISION_MODERN));
         assert_ne!(
@@ -451,7 +471,7 @@ mod tests {
 
     #[test]
     fn touchscreen_memory_sizes_and_decodes() {
-        let mut pci = Pci::new(0, false, true, false);
+        let mut pci = Pci::new(0, false, true, false, false);
         assert_eq!(pci.input_offset(u64::from(INPUT_BAR_DEFAULT)), None);
         write(&mut pci, 1, 0x10, 4, u32::MAX);
         assert_eq!(read(&mut pci, 1, 0x10, 4), !(BAR_SIZE - 1));
@@ -465,7 +485,7 @@ mod tests {
 
     #[test]
     fn the_gpu_follows_the_touchscreen_at_its_own_address() {
-        let mut pci = Pci::new(1, true, true, true);
+        let mut pci = Pci::new(1, true, true, true, false);
         assert_eq!(read(&mut pci, 4, 0x02, 2), u32::from(DEVICE_VIRTIO_GPU));
         assert_eq!(read(&mut pci, 4, 0x0a, 2), u32::from(CLASS_OTHER_DISPLAY));
         assert_eq!(read(&mut pci, 4, 0x08, 1), u32::from(REVISION_MODERN));
@@ -478,15 +498,31 @@ mod tests {
     }
 
     #[test]
+    fn the_balloon_follows_the_gpu_at_its_own_address() {
+        let mut pci = Pci::new(0, false, true, true, true);
+        assert_eq!(read(&mut pci, 3, 0x02, 2), u32::from(DEVICE_VIRTIO_BALLOON));
+        write(&mut pci, 3, 0x04, 2, 2);
+        let base = u64::from(BALLOON_BAR_DEFAULT);
+        assert_eq!(pci.balloon_offset(base + 4), Some(4));
+        assert_eq!(pci.gpu_offset(base + 4), None);
+    }
+
+    #[test]
+    fn the_balloon_needs_no_gpu() {
+        let mut pci = Pci::new(0, false, false, false, true);
+        assert_eq!(read(&mut pci, 1, 0x02, 2), u32::from(DEVICE_VIRTIO_BALLOON));
+    }
+
+    #[test]
     fn gpu_memory_sizes_like_any_modern_device() {
-        let mut pci = Pci::new(0, false, false, true);
+        let mut pci = Pci::new(0, false, false, true, false);
         write(&mut pci, 1, 0x10, 4, u32::MAX);
         assert_eq!(read(&mut pci, 1, 0x10, 4), !(BAR_SIZE - 1));
     }
 
     #[test]
     fn the_network_card_follows_the_disks() {
-        let mut pci = Pci::new(1, true, false, false);
+        let mut pci = Pci::new(1, true, false, false, false);
         assert_eq!(read(&mut pci, 2, 0x02, 2), u32::from(DEVICE_VIRTIO_NET));
         assert_eq!(read(&mut pci, 2, 0x0a, 2), u32::from(CLASS_ETHERNET));
         assert_eq!(read(&mut pci, 2, 0x2e, 2), u32::from(SUBSYSTEM_VIRTIO_NET));
@@ -494,7 +530,7 @@ mod tests {
 
     #[test]
     fn identity_registers_cannot_be_overwritten() {
-        let mut pci = Pci::new(1, false, false, false);
+        let mut pci = Pci::new(1, false, false, false, false);
         write(&mut pci, 1, 0, 4, 0);
         assert_eq!(read(&mut pci, 1, 0, 2), u32::from(VENDOR_VIRTIO));
     }

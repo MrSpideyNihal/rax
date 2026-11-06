@@ -14,7 +14,9 @@ param(
     [ValidateRange(0, 600)][int]$SettleSecs = 300,
     [ValidateRange(1, 300)][int]$IdleSampleSecs = 60,
     # Folder holding virglrenderer. Boots on the virtio GPU when given.
-    [string]$Gpu
+    [string]$Gpu,
+    # Lets Android give unused RAM back to Windows.
+    [switch]$Balloon
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,6 +36,7 @@ $arguments = @(
     '--timeout-secs', ($SettleSecs + $IdleSampleSecs + 90)
 )
 if ($Gpu) { $arguments += '--gpu', $Gpu }
+if ($Balloon) { $arguments += '--balloon' }
 
 $process = Start-Process ./target/release/rax.exe -ArgumentList $arguments -NoNewWindow -PassThru `
     -RedirectStandardOutput 'guest/measure-android.log' `
@@ -53,6 +56,7 @@ $wall = $clock.Elapsed.TotalSeconds
     benchmark           = 'android-rax-idle'
     ram_mib             = $RamMib
     gpu                 = [bool]$Gpu
+    balloon             = [bool]$Balloon
     settle_secs         = 60 + $SettleSecs
     sample_secs         = [math]::Round($wall, 2)
     percent_of_one_core = [math]::Round(100 * $cpu / $wall, 2)

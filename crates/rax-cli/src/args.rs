@@ -23,7 +23,7 @@ pub enum Command {
         out: Option<String>,
     },
     /// Boot a Linux guest.
-    VmRun(VmRun),
+    VmRun(Box<VmRun>),
     /// Check a key-mapping profile.
     InputCheck {
         /// Path to the profile.
@@ -70,6 +70,8 @@ pub struct VmRun {
     pub framebuffer: Option<(u16, u16)>,
     /// Folder holding virglrenderer, which turns on the GPU.
     pub gpu: Option<String>,
+    /// Lets the guest give unused RAM back.
+    pub balloon: bool,
     /// File to save the screen to.
     pub screenshot: Option<String>,
     /// File of timed input for repeatable tests.
@@ -138,6 +140,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut cmdline = None;
     let mut framebuffer = None;
     let mut gpu = None;
+    let mut balloon = false;
     let mut screenshot = None;
     let mut input_script = None;
     let mut network = false;
@@ -146,6 +149,10 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     while let Some(option) = rest.next() {
         if *option == "--shell" {
             shell = true;
+            continue;
+        }
+        if *option == "--balloon" {
+            balloon = true;
             continue;
         }
         if *option == "--net" {
@@ -171,7 +178,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             other => return Err(format!("unknown option: {other}")),
         }
     }
-    Ok(Command::VmRun(VmRun {
+    Ok(Command::VmRun(Box::new(VmRun {
         kernel: kernel.ok_or("--kernel is required")?,
         initrd: initrd.ok_or("--initrd is required")?,
         ram_mib,
@@ -182,11 +189,12 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         cmdline,
         framebuffer,
         gpu,
+        balloon,
         screenshot,
         input_script,
         network,
         touch_script,
-    }))
+    })))
 }
 
 fn screen_size(value: &str) -> Result<(u16, u16), String> {
@@ -281,7 +289,7 @@ mod tests {
                 "--ram-mib",
                 "256"
             ]),
-            Ok(Command::VmRun(VmRun {
+            Ok(Command::VmRun(Box::new(VmRun {
                 kernel: "k".to_owned(),
                 initrd: "i".to_owned(),
                 ram_mib: 256,
@@ -292,11 +300,12 @@ mod tests {
                 cmdline: None,
                 framebuffer: None,
                 gpu: None,
+                balloon: false,
                 screenshot: None,
                 input_script: None,
                 network: false,
                 touch_script: None,
-            }))
+            })))
         );
     }
 

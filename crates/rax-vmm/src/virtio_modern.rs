@@ -191,6 +191,11 @@ impl Common {
         self.isr |= ISR_QUEUE;
     }
 
+    /// Records a reason for an interrupt.
+    pub fn signal(&mut self, reason: u8) {
+        self.isr |= reason;
+    }
+
     /// Reads and clears the interrupt status.
     pub fn take_isr(&mut self) -> u8 {
         std::mem::take(&mut self.isr)

@@ -10,6 +10,7 @@ use crate::pit::Pit;
 use crate::ps2::{GuestInput, Ps2, Ps2Irq};
 use crate::rtc::Rtc;
 use crate::serial::{Serial, Sink};
+use crate::virtio_balloon::VirtioBalloon;
 use crate::virtio_blk::{GuestMemory, VirtioBlk};
 use crate::virtio_input::VirtioInput;
 use crate::virtio_net::VirtioNet;
@@ -65,6 +66,8 @@ pub struct IoStats {
     pub frames_in: u64,
     /// Frames sent by the guest.
     pub frames_out: u64,
+    /// Pages the balloon holds at the end of the run.
+    pub balloon_pages: u64,
     /// Accesses to ports with no device.
     pub unclaimed: u64,
 }
@@ -82,6 +85,7 @@ pub struct Bus {
     disks: Vec<VirtioBlk>,
     network: Option<VirtioNet>,
     touch: Option<VirtioInput>,
+    balloon: Option<VirtioBalloon>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -97,6 +101,7 @@ impl Bus {
         network: Option<VirtioNet>,
         touch: Option<VirtioInput>,
         gpu: bool,
+        balloon: Option<VirtioBalloon>,
     ) -> Self {
         Self {
             pic: Pic::default(),
@@ -106,10 +111,17 @@ impl Bus {
             wall_clock,
             serial: Serial::new(console),
             ps2: Ps2::default(),
-            pci: Pci::new(disks.len(), network.is_some(), touch.is_some(), gpu),
+            pci: Pci::new(
+                disks.len(),
+                network.is_some(),
+                touch.is_some(),
+                gpu,
+                balloon.is_some(),
+            ),
             disks,
             network,
             touch,
+            balloon,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
@@ -302,15 +314,33 @@ impl Bus {
             screen.service(memory);
             raise |= screen.take_irq();
         }
+        if let Some(balloon) = self.balloon.as_mut() {
+            balloon.service(memory);
+            raise |= balloon.take_irq();
+            self.stats.balloon_pages = u64::from(balloon.pages_returned());
+        }
         if raise {
             self.pic.raise(VIRTIO_IRQ);
+        }
+    }
+
+    /// Lets the balloon check the guest's spare memory. Call while the vCPU
+    /// is stopped.
+    pub fn poll_balloon(&mut self, now_ns: u64, memory: &dyn GuestMemory) {
+        if let Some(balloon) = self.balloon.as_mut() {
+            balloon.poll(now_ns, memory);
+            if balloon.take_irq() {
+                self.pic.raise(VIRTIO_IRQ);
+            }
         }
     }
 
     /// Whether a memory address belongs to a device.
     #[must_use]
     pub fn owns_memory(&self, gpa: u64) -> bool {
-        self.pci.input_offset(gpa).is_some() || self.pci.gpu_offset(gpa).is_some()
+        self.pci.input_offset(gpa).is_some()
+            || self.pci.gpu_offset(gpa).is_some()
+            || self.pci.balloon_offset(gpa).is_some()
     }
 
     /// Finds the GPU register a memory address belongs to. The GPU itself
@@ -327,6 +357,10 @@ impl Bus {
 
     /// Handles a device memory load.
     pub fn memory_read(&mut self, gpa: u64, size: u8) -> u32 {
+        if let (Some(offset), Some(balloon)) = (self.pci.balloon_offset(gpa), self.balloon.as_mut())
+        {
+            return balloon.read(offset, size);
+        }
         match (self.pci.input_offset(gpa), self.touch.as_mut()) {
             (Some(offset), Some(screen)) => screen.read(offset, size),
             _ => FLOATING_BUS,
@@ -335,6 +369,11 @@ impl Bus {
 
     /// Handles a device memory store.
     pub fn memory_write(&mut self, gpa: u64, value: u32) {
+        if let (Some(offset), Some(balloon)) = (self.pci.balloon_offset(gpa), self.balloon.as_mut())
+        {
+            balloon.write(offset, value);
+            return;
+        }
         if let (Some(offset), Some(screen)) = (self.pci.input_offset(gpa), self.touch.as_mut()) {
             screen.write(offset, value);
         }
@@ -446,6 +485,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             ),
             capture,
         )

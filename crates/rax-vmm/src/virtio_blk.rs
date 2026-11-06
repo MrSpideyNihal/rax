@@ -50,6 +50,14 @@ pub trait GuestMemory {
     fn read(&self, gpa: u64, buffer: &mut [u8]) -> Result<(), OutOfRange>;
     /// Copies `bytes` to `gpa`.
     fn write(&self, gpa: u64, bytes: &[u8]) -> Result<(), OutOfRange>;
+
+    /// Gives guest pages back to the host, possibly later, on another
+    /// thread. Their contents are lost. Doing nothing is always correct,
+    /// because this only saves memory.
+    fn discard(&self, _gpa: u64, _length: u64) {}
+
+    /// Waits until every earlier [`Self::discard`] has really happened.
+    fn finish_discards(&self) {}
 }
 
 /// Storage behind the device.

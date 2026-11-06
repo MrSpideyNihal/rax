@@ -17,6 +17,7 @@ pub mod pit;
 pub mod ps2;
 pub mod rtc;
 pub mod serial;
+pub mod virtio_balloon;
 pub mod virtio_blk;
 pub mod virtio_gpu;
 pub mod virtio_input;

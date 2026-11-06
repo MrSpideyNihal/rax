@@ -267,6 +267,7 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
             .framebuffer
             .map(|(width, height)| Framebuffer { width, height }),
         gpu: options.gpu.as_ref().map(PathBuf::from),
+        balloon: options.balloon,
         screenshot: options.screenshot.as_ref().map(PathBuf::from),
         network: options.network.then(rax_net::host::Network::start),
         touchscreen: options.touch_script.is_some(),

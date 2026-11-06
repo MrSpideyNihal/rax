@@ -88,6 +88,7 @@ const _: () = assert!(size_of::<RegisterValue>() == 16);
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn DiscardVirtualMemory(address: *mut c_void, size: usize) -> u32;
     fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
     fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
     fn GetLastError() -> u32;
@@ -336,6 +337,37 @@ impl GuestRegion {
     /// into guest memory.
     pub(crate) fn raw_parts(&self) -> (*mut u8, usize) {
         (self.base.as_ptr().cast(), self.size)
+    }
+}
+
+/// Gives whole pages inside `gpa..gpa + len` of a guest region back to
+/// Windows. The guest must not need their contents: they read back as
+/// anything.
+///
+/// # Safety
+///
+/// `base` must be the start of a live allocation of `size` bytes.
+pub(crate) unsafe fn discard_pages(base: *mut u8, size: usize, gpa: u64, len: usize) -> Result<()> {
+    let page = PAGE as u64;
+    let first = gpa.next_multiple_of(page);
+    let last = gpa.saturating_add(len as u64) / page * page;
+    if last <= first {
+        return Ok(());
+    }
+    let bytes = (last - first) as usize;
+    let offset = crate::vm::check_range(first, bytes, size)?;
+    // SAFETY: `check_range` proved the page-aligned range lies inside the
+    // allocation the caller vouches for. The call changes what the memory
+    // holds, never whether it is valid, and guest RAM is only ever reached
+    // through raw copies, so no reference can be invalidated.
+    let code = unsafe { DiscardVirtualMemory(base.add(offset).cast(), bytes) };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(Error::Win32 {
+            api: "DiscardVirtualMemory",
+            code,
+        })
     }
 }
 

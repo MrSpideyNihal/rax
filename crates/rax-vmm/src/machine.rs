@@ -5,12 +5,12 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rax_host::virgl::Renderer;
-use rax_host::vm::{self, Kicker, Vm};
+use rax_host::vm::{self, Kicker, RamReleaser, Vm};
 use rax_host::whp::{Api, ExitInfo, VmExit};
 use rax_input::Touch;
 use rax_net::host::Network;
@@ -24,6 +24,7 @@ use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
 use crate::mmio;
 use crate::ps2::GuestInput;
 use crate::serial::Sink;
+use crate::virtio_balloon::VirtioBalloon;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
 use crate::virtio_gpu::{self, GpuStats, Scanout, VirtioGpu};
 use crate::virtio_input::VirtioInput;
@@ -42,6 +43,8 @@ const TIMER_IDLE: Duration = Duration::from_millis(1);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often a sleeping guest checks for a request to stop.
 const HALT_POLL: Duration = Duration::from_millis(50);
+/// The longest the guest waits for RAM to finish being released.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
 /// Console text kept for a running app, in bytes.
 const CONSOLE_KEEP: usize = 16 * 1024;
 
@@ -99,6 +102,8 @@ pub struct Config {
     pub network: Option<Network>,
     /// Gives the guest a multi-touch screen.
     pub touchscreen: bool,
+    /// Lets the guest give unused RAM back to the host.
+    pub balloon: bool,
     /// Connects a live window. `None` runs headless.
     pub display: Option<Display>,
     /// Timed input, for repeatable tests with no person at the keyboard.
@@ -255,6 +260,35 @@ struct Shared {
     touch_ready: AtomicBool,
     /// Set when the network has frames waiting for the guest.
     network_ready: Option<Arc<AtomicBool>>,
+    /// Hands guest RAM to the thread that gives it back to Windows.
+    releases: Sender<Release>,
+}
+
+/// Work for the thread that gives RAM back. Windows takes up to milliseconds
+/// per call, so doing this on the vCPU thread starved the guest: measured,
+/// 11 seconds of guest time passed in 4 minutes.
+enum Release {
+    Discard {
+        gpa: u64,
+        length: u64,
+    },
+    /// Answered once everything sent earlier is done.
+    Finish(Sender<()>),
+}
+
+fn release_loop(shared: &Shared, releaser: &RamReleaser<'_>, work: &Receiver<Release>) {
+    while !shared.stop.load(Ordering::Relaxed) {
+        match work.recv_timeout(HALT_POLL) {
+            Ok(Release::Discard { gpa, length }) => {
+                // A failure only means this memory stays with the guest.
+                let _ = releaser.discard(gpa, length as usize);
+            }
+            Ok(Release::Finish(done)) => {
+                let _ = done.send(());
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 impl Shared {
@@ -386,7 +420,7 @@ fn wait_while_halted(shared: &Shared, deadline: Instant) -> Result<(), &'static 
 }
 
 /// Guest RAM for devices. Only used while the vCPU is stopped at an exit.
-struct RamView<'a, 'b>(&'a Vm<'b>);
+struct RamView<'a, 'b>(&'a Vm<'b>, &'a Shared);
 
 impl GuestMemory for RamView<'_, '_> {
     fn read(&self, gpa: u64, buffer: &mut [u8]) -> Result<(), OutOfRange> {
@@ -395,6 +429,18 @@ impl GuestMemory for RamView<'_, '_> {
 
     fn write(&self, gpa: u64, bytes: &[u8]) -> Result<(), OutOfRange> {
         self.0.write_ram(gpa, bytes).map_err(|_| OutOfRange)
+    }
+
+    fn discard(&self, gpa: u64, length: u64) {
+        let _ = self.1.releases.send(Release::Discard { gpa, length });
+    }
+
+    fn finish_discards(&self) {
+        let (done, finished) = mpsc::channel();
+        if self.1.releases.send(Release::Finish(done)).is_ok() {
+            // No answer only means RAX is shutting down.
+            let _ = finished.recv_timeout(RELEASE_WAIT);
+        }
     }
 }
 
@@ -447,7 +493,7 @@ fn gpu_store(
     value: u32,
 ) -> Result<(), Box<dyn Error>> {
     if gpu.device.write(offset, value) {
-        gpu.device.service(&RamView(vm), &mut gpu.renderer);
+        gpu.device.service(&RamView(vm, shared), &mut gpu.renderer);
         if gpu.device.take_irq() {
             shared
                 .bus
@@ -499,7 +545,7 @@ fn device_memory(
             None => stored_register(vm.general_register(access.register)?, access.size),
         };
         bus.memory_write(gpa, value);
-        bus.service_devices(&RamView(vm));
+        bus.service_devices(&RamView(vm, shared));
         vm.advance(info, access.length)?;
     } else {
         let value = bus.memory_read(gpa, access.size);
@@ -602,13 +648,16 @@ fn vcpu_loop(
         }
         {
             let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+            if frame_due {
+                bus.poll_balloon(shared.now_ns(), &RamView(vm, shared));
+            }
             let touched = shared.touch_ready.swap(false, Ordering::Relaxed);
             let frames = shared
                 .network_ready
                 .as_ref()
                 .is_some_and(|ready| ready.swap(false, Ordering::Relaxed));
             if touched || frames {
-                bus.service_devices(&RamView(vm));
+                bus.service_devices(&RamView(vm, shared));
             }
             if bus.reset_requested() {
                 return Ok(Finished {
@@ -647,7 +696,7 @@ fn vcpu_loop(
                 let now = shared.now_ns();
                 let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
                 bus.write(port, size, value, now);
-                bus.service_devices(&RamView(vm));
+                bus.service_devices(&RamView(vm, shared));
                 drop(bus);
                 vm.skip_instruction(&info)?;
             }
@@ -806,6 +855,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     });
     let started = Instant::now();
     let deadline = started + config.timeout;
+    let (releases, release_work) = mpsc::channel();
     let shared = Shared {
         bus: Mutex::new(Bus::new(
             Box::new(console),
@@ -814,6 +864,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
             card,
             config.touchscreen.then(VirtioInput::default),
             config.gpu.is_some(),
+            config.balloon.then(VirtioBalloon::default),
         )),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
@@ -826,8 +877,10 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         touch_script: config.touch_script.clone(),
         touch_ready: AtomicBool::new(false),
         network_ready,
+        releases,
     };
     let kicker = vm.kicker();
+    let releaser = vm.ram_releaser();
     let input = config.shell.then(spawn_stdin_reader);
     let mut gpu = match (&config.gpu, config.framebuffer) {
         (Some(folder), Some(screen)) => Some(Gpu {
@@ -842,6 +895,8 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let finished = std::thread::scope(|scope| {
         let (timer_shared, timer_kicker) = (&shared, &kicker);
         scope.spawn(move || timer_loop(timer_shared, timer_kicker, input.as_ref()));
+        let (release_shared, release_handle) = (&shared, &releaser);
+        scope.spawn(move || release_loop(release_shared, release_handle, &release_work));
         let result = vcpu_loop(&vm, &shared, &mut gpu, deadline);
         shared.stop.store(true, Ordering::Relaxed);
         result

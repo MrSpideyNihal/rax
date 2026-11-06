@@ -212,6 +212,19 @@ The screenshot was saved by `--screenshot` from guest memory.
 
 Each idle figure is one 60 s sample, and the GPU one settled for 3 minutes where the software one settled for 6. Host GPU memory is not included. None of this is a game result: **frame rate has not been measured.**
 
+### Returning memory with a balloon
+
+Experimental, behind `--balloon`, and **off in the app**. Android 9 with 3 GB of guest RAM on the GPU, on 2026-11-07. Android willingly hands pages over. Giving them to Windows with `DiscardVirtualMemory` is the problem.
+
+| Release unit | Android responsive? | Host RAM | Note |
+|---|---|---|---|
+| 4 KiB, on the vCPU thread | No | Fell, to about 1.4 GB in one run | 87,000 calls took 78 s, rising to several ms each |
+| 4 KiB, background thread | No | 3173 to 2822 MiB | A guest `sleep 120` had not ended after 6 minutes |
+| 64 KiB, background thread | No | 3170 to about 2835 MiB | The same sleep never returned before the time limit |
+| 2 MiB, background thread | **Yes** | **No change**, 3169 MiB | 1.67 GB handed over, but apparently no complete block |
+
+The cause of the stall under fine-grained discards is inferred from these runs, not proven.
+
 ### RAX beside the Android Studio emulator
 
 | | RAX | Android Studio emulator |

@@ -8,8 +8,8 @@ use std::path::Path;
 
 use crate::virgl::Renderer;
 use crate::whp::{
-    Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, map_guest_memory, map_guest_ram,
-    map_read_only, read_exit,
+    Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, discard_pages, map_guest_memory,
+    map_guest_ram, map_read_only, read_exit,
 };
 use crate::{Error, Result};
 
@@ -64,6 +64,17 @@ impl<'a> Vm<'a> {
     /// Fills `buffer` from guest RAM at `gpa`.
     pub fn read_ram(&self, gpa: u64, buffer: &mut [u8]) -> Result<()> {
         self.ram.read_at(gpa, buffer)
+    }
+
+    /// A handle another thread uses to give guest RAM back to Windows.
+    #[must_use]
+    pub fn ram_releaser(&self) -> RamReleaser<'_> {
+        let (ram, size) = self.ram.raw_parts();
+        RamReleaser {
+            ram,
+            size,
+            _vm: PhantomData,
+        }
     }
 
     /// Starts the GPU renderer from `folder`. It may only use guest RAM while
@@ -155,6 +166,29 @@ impl<'a> Vm<'a> {
             handle,
             _vm: PhantomData,
         }
+    }
+}
+
+/// Gives guest RAM back to Windows from any thread. Borrowing the `Vm` keeps
+/// the RAM alive.
+pub struct RamReleaser<'a> {
+    ram: *mut u8,
+    size: usize,
+    _vm: PhantomData<&'a ()>,
+}
+
+// SAFETY: the pointer is only passed to DiscardVirtualMemory, which any
+// thread may call, and the lifetime keeps the allocation alive.
+unsafe impl Send for RamReleaser<'_> {}
+// SAFETY: as above. The call needs no synchronisation on the caller's side.
+unsafe impl Sync for RamReleaser<'_> {}
+
+impl RamReleaser<'_> {
+    /// Discards guest RAM the guest has given up.
+    pub fn discard(&self, gpa: u64, length: usize) -> Result<()> {
+        // SAFETY: `ram` and `size` describe the Vm's RAM, which the lifetime
+        // keeps alive for as long as this handle exists.
+        unsafe { discard_pages(self.ram, self.size, gpa, length) }
     }
 }
 

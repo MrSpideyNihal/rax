@@ -37,7 +37,7 @@ timeout=$((wait_secs + (lines + 2) * step_secs + 10 + ${EXTRA_SECS:-0}))
 ) | ./target/release/rax.exe vm run --shell --kernel guest/kernel \
     --initrd guest/initrd.img --disk guest/android-x86_64-9.0-r2.iso \
     --ram-mib "$ram_mib" --timeout-secs "$timeout" --cmdline "$cmdline" \
-    ${NET:+--net} ${GPU:+--gpu "$GPU"} --framebuffer "${SCREEN:-1280x720}" \
+    ${NET:+--net} ${GPU:+--gpu "$GPU"} ${BALLOON:+--balloon} --framebuffer "${SCREEN:-1280x720}" \
     --screenshot "$log.bmp" \
     --report "$log.json" > "$log" 2>&1
 echo "exit $?"
