@@ -24,6 +24,11 @@ pub enum Command {
     },
     /// Boot a Linux guest.
     VmRun(VmRun),
+    /// Check a key-mapping profile.
+    InputCheck {
+        /// Path to the profile.
+        profile: String,
+    },
     /// Print usage.
     Help,
     /// Print the version.
@@ -59,6 +64,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         ["doctor", "--json"] => Ok(Command::Doctor { json: true }),
         ["bench", "whp", options @ ..] => parse_bench(options),
         ["vm", "run", options @ ..] => parse_vm_run(options),
+        ["input", "check", profile] => Ok(Command::InputCheck {
+            profile: (*profile).to_owned(),
+        }),
         [other, ..] => Err(format!("unknown command or option: {other}")),
     }
 }
@@ -217,6 +225,17 @@ mod tests {
                 disk: None,
             }))
         );
+    }
+
+    #[test]
+    fn input_check_takes_a_path() {
+        assert_eq!(
+            run(&["input", "check", "p.json"]),
+            Ok(Command::InputCheck {
+                profile: "p.json".to_owned()
+            })
+        );
+        assert!(run(&["input", "check"]).is_err());
     }
 
     #[test]

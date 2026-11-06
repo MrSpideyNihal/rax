@@ -28,6 +28,7 @@ pub fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             out,
         } => bench_whp(iterations, map_mib, out.as_deref()),
         Command::VmRun(options) => vm_run(&options),
+        Command::InputCheck { profile } => input_check(&profile),
         Command::Help | Command::Version => unreachable!("handled in main"),
     }
 }
@@ -161,6 +162,18 @@ struct VmRunResult {
     captured_at_unix: u64,
     host: HostInfo,
     run: Report,
+}
+
+fn input_check(path: &str) -> Result<ExitCode, Box<dyn Error>> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("could not read {path}: {error}"))?;
+    let profile = rax_input::Profile::from_json(&text)?;
+    println!(
+        "{}: {} bindings, valid",
+        profile.name,
+        profile.bindings.len()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {

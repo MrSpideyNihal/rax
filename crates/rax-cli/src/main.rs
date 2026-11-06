@@ -17,6 +17,7 @@ USAGE:
     rax bench whp [--iterations N] [--map-mib N] [--out FILE]
     rax vm run --kernel FILE --initrd FILE [--ram-mib N] [--timeout-secs N]
                [--shell] [--disk FILE] [--report FILE]
+    rax input check FILE
     rax --version
     rax --help
 
@@ -25,6 +26,7 @@ COMMANDS:
                Exit code: 0 ready, 1 error, 2 a blocker was found.
     bench whp  Run a tiny guest and measure hypervisor costs.
     vm run     Boot a Linux guest on RAX's own VM, with a serial console.
+    input check  Validate a key-mapping profile.
 ";
 
 fn main() -> ExitCode {

@@ -29,6 +29,19 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 | Hardware OpenGL ES | Not started |
 | Hardware Vulkan | Not started |
 
+## Free Fire and BGMI
+
+Goals, not support claims. See [ADR-0007](ADR/0007-game-goals-and-input.md).
+
+| Item | Free Fire | BGMI |
+|---|---|---|
+| Runs on RAX | **Not tested** | **Not tested, and blocked** |
+| Native x86 build | Not confirmed | None listed, `arm64-v8a` only |
+| Emulator rules | Reported separate pool and leaderboard exclusion | Reported banned from competitive events |
+| Key mapping | Engine tested alone, positions not set | Engine tested alone, positions not set |
+
+Your account carries the risk of following or breaking each game's rules. RAX does not hide from anti-cheat, and has no macros.
+
 ## Minecraft Bedrock (Android)
 
 | Item | Status | Evidence |

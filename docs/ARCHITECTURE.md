@@ -42,7 +42,8 @@ flowchart TB
 |---|---|---|
 | `crates/rax-host` | **exists** | OS integration and all current `unsafe`: WHP, Vulkan probing, host facts, readiness rules, statistics |
 | `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT, RTC, PCI and virtio-blk devices, one vCPU. Forbids `unsafe` |
-| `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`. Forbids `unsafe` |
+| `crates/rax-input` | **exists, not connected** | Key-mapping profiles, keyboard and mouse to touch events. Forbids `unsafe` |
+| `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`, `rax input check`. Forbids `unsafe` |
 | Multiple vCPUs, more virtio devices | planned, Phase 1b | Required before Android is usable |
 | Input bridge | planned, Phase 3 | Raw Input to virtio-input |
 | Launcher UI | planned, after the GPU pipeline | Small native window |
@@ -60,13 +61,15 @@ The ring design matters because it limits VM exits. Exit cost is low (about 3 µ
 
 ### Input
 
+Two kinds of game need different paths. Games with keyboard support may get a real mouse and keyboard, and touch-only games such as Free Fire use the key-mapping engine in `rax-input`, which turns physical input into virtual fingers.
+
 Planned design, to be validated:
 
 ```
 Raw Input (WM_INPUT) --> rax.exe --> virtio-input --> guest evdev
 ```
 
-The hypothesis is that Android apps should see a **real mouse and keyboard**, not synthesized touch, because that removes a translation layer. Android supports pointer capture, and Minecraft on ChromeOS suggests keyboard and mouse handling exists in the game. This is unverified for Bedrock on Android. Touch mapping is the fallback only.
+The hypothesis is that Android apps should see a **real mouse and keyboard**, not synthesized touch, because that removes a translation layer. Android supports pointer capture, and Minecraft on ChromeOS suggests keyboard and mouse handling exists in the game. This is unverified for Bedrock on Android. Touch mapping is required for touch-only games. Keyboard and mouse state stay independent, so one device leaving never affects the other ([ADR-0007](ADR/0007-game-goals-and-input.md)).
 
 ### Memory
 

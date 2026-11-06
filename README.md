@@ -28,7 +28,8 @@ Read the [feasibility report](docs/FEASIBILITY.md). The short version:
 
 - **The runtime looks buildable.** WHP works, and exit cost is not the bottleneck. Android and GPU forwarding are the hard parts still ahead.
 - **Google Play is the real obstacle.** It needs a licence from Google, and engineering cannot replace that. RAX will not bundle, spoof or bypass it ([ADR-0005](docs/ADR/0005-google-play-policy.md)).
-- **ARM translation may be avoidable.** Minecraft lists an x86_64 Android build, though that is untested here.
+- **ARM translation may be avoidable for Minecraft,** which lists an x86_64 Android build, though that is untested here. **BGMI is listed as ARM-only, so it is blocked** until a legal translation path exists.
+- **Free Fire and BGMI are goals, not promises.** RAX has no macros and will not hide from anti-cheat ([ADR-0007](docs/ADR/0007-game-goals-and-input.md)).
 - **There is no GPU passthrough.** The plan is API forwarding with gfxstream, and we will call it that.
 
 ## Quick start
