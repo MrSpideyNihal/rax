@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "benchmark": "whp-exit-and-map",
+  "rax_version": "0.1.0",
+  "profile": "release",
+  "captured_at_unix": 1793957015,
+  "host": {
+    "cpu": "AMD Ryzen 7 7445HS w/ Radeon 740M Graphics",
+    "logical_cpus": 12,
+    "total_ram_mib": 15636,
+    "available_ram_mib": 6317,
+    "windows_version": "10.0.26300"
+  },
+  "hypervisor": {
+    "hypervisor_present": true,
+    "features": 767,
+    "processor_vendor": "AMD"
+  },
+  "iterations": 200000,
+  "exit_latency": {
+    "run_to_exit": {
+      "count": 200000,
+      "mean_ns": 3095.5695,
+      "stddev_ns": 1076.3088407468208,
+      "min_ns": 2900,
+      "p50_ns": 3000,
+      "p99_ns": 3900,
+      "p999_ns": 9600,
+      "max_ns": 259600
+    },
+    "mean_full_exit_cycle_ns": 3175.1795
+  },
+  "memory_map": {
+    "size_mib": 1024,
+    "partition_create_us": 464.70000000000005,
+    "map_us": 9706.9,
+    "unmap_us": 9989.9
+  }
+}

@@ -1,0 +1,18 @@
+name: Benchmark result
+description: Share results from your hardware
+labels: [benchmark]
+body:
+  - type: textarea
+    id: result
+    attributes:
+      label: Unedited JSON from `rax bench`
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: conditions
+    attributes:
+      label: Conditions
+      description: Mains or battery, power plan, running applications.
+    validations:
+      required: true

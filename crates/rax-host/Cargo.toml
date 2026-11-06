@@ -1,0 +1,15 @@
+[package]
+name = "rax-host"
+description = "Windows host probes and hypervisor measurements for the RAX runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

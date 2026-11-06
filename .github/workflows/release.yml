@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo test --workspace --locked
+      - run: cargo build --release -p rax-cli --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "rax-$env:GITHUB_REF_NAME-x86_64-windows"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item target/release/rax.exe, LICENSE, README.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
+            Out-File -Encoding ascii "$name.zip.sha256"
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = "rax-$env:GITHUB_REF_NAME-x86_64-windows"
+          gh release create $env:GITHUB_REF_NAME "$name.zip" "$name.zip.sha256" --generate-notes --prerelease
