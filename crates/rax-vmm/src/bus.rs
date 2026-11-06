@@ -7,12 +7,17 @@ use serde::Serialize;
 use crate::pci::{Pci, VIRTIO_IRQ};
 use crate::pic::Pic;
 use crate::pit::Pit;
+use crate::ps2::{GuestInput, Ps2, Ps2Irq};
 use crate::rtc::Rtc;
 use crate::serial::{Serial, Sink};
 use crate::virtio_blk::{GuestMemory, VirtioBlk};
 
 const IRQ_TIMER: u8 = 0;
+const IRQ_KEYBOARD: u8 = 1;
+const IRQ_CASCADE: u8 = 2;
 const IRQ_SERIAL: u8 = 4;
+/// The mouse line on the slave PIC, IRQ 12 overall.
+const SLAVE_IRQ_MOUSE: u8 = 4;
 
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -22,6 +27,7 @@ const PIT_CONTROL: u16 = 0x43;
 const SPEAKER_CONTROL: u16 = 0x61;
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
+const KEYBOARD_DATA: u16 = 0x60;
 const KEYBOARD_STATUS: u16 = 0x64;
 const PIC2_COMMAND: u16 = 0xa0;
 const PIC2_DATA: u16 = 0xa1;
@@ -64,8 +70,9 @@ pub struct Bus {
     rtc: Rtc,
     wall_clock: fn() -> u64,
     serial: Serial,
+    ps2: Ps2,
     pci: Pci,
-    disk: Option<VirtioBlk>,
+    disks: Vec<VirtioBlk>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -74,7 +81,7 @@ pub struct Bus {
 impl Bus {
     /// Creates the machine's devices.
     #[must_use]
-    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64, disk: Option<VirtioBlk>) -> Self {
+    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64, disks: Vec<VirtioBlk>) -> Self {
         Self {
             pic: Pic::default(),
             slave_pic: Pic::default(),
@@ -82,8 +89,9 @@ impl Bus {
             rtc: Rtc::default(),
             wall_clock,
             serial: Serial::new(console),
-            pci: Pci::new(disk.is_some()),
-            disk,
+            ps2: Ps2::default(),
+            pci: Pci::new(disks.len()),
+            disks,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
@@ -124,6 +132,12 @@ impl Bus {
                 self.stats.clock += 1;
                 u32::from(self.rtc.read_data((self.wall_clock)()))
             }
+            KEYBOARD_DATA => {
+                let byte = self.ps2.read_data();
+                self.collect_ps2_irq();
+                u32::from(byte)
+            }
+            KEYBOARD_STATUS => u32::from(self.ps2.read_status()),
             COM1_START..=COM1_END => {
                 self.stats.serial += 1;
                 let byte = self.serial.read(port - COM1_START);
@@ -138,12 +152,12 @@ impl Bus {
                 self.stats.pci += 1;
                 self.pci.read_data(port - PCI_DATA_START, size)
             }
-            _ => match (self.pci.virtio_offset(port), self.disk.as_mut()) {
-                (Some(offset), Some(disk)) => {
+            _ => match self.pci.virtio_offset(port) {
+                Some((index, offset)) => {
                     self.stats.disk += 1;
-                    disk.read(offset, size)
+                    self.disks[index].read(offset, size)
                 }
-                _ => {
+                None => {
                     self.count_unclaimed(port);
                     FLOATING_BUS
                 }
@@ -194,6 +208,14 @@ impl Bus {
                 self.rtc.write_index(byte);
             }
             KEYBOARD_STATUS if byte == KEYBOARD_PULSE_RESET => self.reset_requested = true,
+            KEYBOARD_STATUS => {
+                self.ps2.write_command(byte);
+                self.collect_ps2_irq();
+            }
+            KEYBOARD_DATA => {
+                self.ps2.write_data(byte);
+                self.collect_ps2_irq();
+            }
             COM1_START..=COM1_END => {
                 self.stats.serial += 1;
                 self.serial.write(port - COM1_START, byte);
@@ -207,12 +229,12 @@ impl Bus {
                 self.stats.pci += 1;
                 self.pci.write_data(port - PCI_DATA_START, size, value);
             }
-            _ => match (self.pci.virtio_offset(port), self.disk.as_mut()) {
-                (Some(offset), Some(disk)) => {
+            _ => match self.pci.virtio_offset(port) {
+                Some((index, offset)) => {
                     self.stats.disk += 1;
-                    disk.write(offset, value);
+                    self.disks[index].write(offset, value);
                 }
-                _ => self.count_unclaimed(port),
+                None => self.count_unclaimed(port),
             },
         }
     }
@@ -234,13 +256,32 @@ impl Bus {
     /// Runs any disk requests the guest has queued. Call after a port write,
     /// while the vCPU is stopped.
     pub fn service_disk(&mut self, memory: &dyn GuestMemory) {
-        if let Some(disk) = self.disk.as_mut() {
+        let mut raise = false;
+        for disk in &mut self.disks {
             disk.service(memory);
-            self.stats.disk_requests = disk.requests();
-            if disk.take_irq() {
-                self.pic.raise(VIRTIO_IRQ);
-            }
+            raise |= disk.take_irq();
         }
+        self.stats.disk_requests = self.disks.iter().map(VirtioBlk::requests).sum();
+        if raise {
+            self.pic.raise(VIRTIO_IRQ);
+        }
+    }
+
+    fn collect_ps2_irq(&mut self) {
+        match self.ps2.take_irq() {
+            Some(Ps2Irq::Keyboard) => self.pic.raise(IRQ_KEYBOARD),
+            Some(Ps2Irq::Mouse) => {
+                self.slave_pic.raise(SLAVE_IRQ_MOUSE);
+                self.pic.raise(IRQ_CASCADE);
+            }
+            None => {}
+        }
+    }
+
+    /// Passes a physical keyboard or mouse event to the guest.
+    pub fn guest_input(&mut self, input: GuestInput) {
+        self.ps2.input(input);
+        self.collect_ps2_irq();
     }
 
     fn collect_serial_irq(&mut self) {
@@ -272,11 +313,19 @@ impl Bus {
     /// The vector to deliver next.
     #[must_use]
     pub fn pending_vector(&self) -> Option<u8> {
-        self.pic.pending_vector()
+        let vector = self.pic.pending_vector()?;
+        if self.pic.pending_irq() == Some(IRQ_CASCADE) {
+            self.slave_pic.pending_vector()
+        } else {
+            Some(vector)
+        }
     }
 
     /// Records that the pending vector was delivered.
     pub fn acknowledge_interrupt(&mut self) {
+        if self.pic.pending_irq() == Some(IRQ_CASCADE) {
+            self.slave_pic.acknowledge();
+        }
         self.pic.acknowledge();
     }
 
@@ -309,7 +358,10 @@ mod tests {
 
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
-        (Bus::new(Box::new(capture.clone()), || 0, None), capture)
+        (
+            Bus::new(Box::new(capture.clone()), || 0, Vec::new()),
+            capture,
+        )
     }
 
     fn init_pic(bus: &mut Bus) {
@@ -384,6 +436,49 @@ mod tests {
         bus.write(0x70, 1, 0x0a, 0);
         assert_eq!(bus.read(0x71, 1, 0) & 0x80, 0);
         assert_eq!(bus.stats().unclaimed, 0);
+    }
+
+    fn init_both_pics(bus: &mut Bus) {
+        init_pic(bus);
+        for (port, value) in [
+            (0xa0, 0x11),
+            (0xa1, 0x38),
+            (0xa1, 0x02),
+            (0xa1, 0x01),
+            (0xa1, 0x00),
+        ] {
+            bus.write(port, 1, value, 0);
+        }
+    }
+
+    #[test]
+    fn keyboard_input_reaches_port_0x60_with_irq_1() {
+        let (mut bus, _) = bus();
+        init_pic(&mut bus);
+        bus.guest_input(GuestInput::Key {
+            scancode: 0x1e,
+            extended: false,
+            down: true,
+        });
+        assert_eq!(bus.pending_vector(), Some(0x31));
+        assert_eq!(bus.read(0x64, 1, 0) & 1, 1);
+        assert_eq!(bus.read(0x60, 1, 0), 0x1e);
+    }
+
+    #[test]
+    fn mouse_interrupts_cascade_through_the_slave() {
+        let (mut bus, _) = bus();
+        init_both_pics(&mut bus);
+        bus.write(0x64, 1, 0x60, 0); // Write config.
+        bus.write(0x60, 1, 0x03, 0); // Enable both interrupts.
+        bus.write(0x64, 1, 0xd4, 0); // Next byte goes to the mouse.
+        bus.write(0x60, 1, 0xf4, 0); // Enable reporting.
+        assert_eq!(bus.pending_vector(), Some(0x3c), "the acknowledgement");
+        bus.acknowledge_interrupt();
+        assert_eq!(bus.read(0x60, 1, 0), 0xfa);
+        bus.write(0xa0, 1, 0x64, 0); // Slave EOI for its line 4.
+        bus.write(0x20, 1, 0x62, 0); // Master EOI for the cascade.
+        assert_eq!(bus.pending_vector(), None);
     }
 
     #[test]

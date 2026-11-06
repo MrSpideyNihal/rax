@@ -11,6 +11,7 @@ use rax_host::vulkan::{self, Device};
 use rax_host::whp::{self, Capabilities, ExitLatency, MapCost};
 use rax_vmm::framebuffer::Framebuffer;
 use rax_vmm::machine::{self, Config, Outcome, Report};
+use rax_vmm::ps2::GuestInput;
 use serde::Serialize;
 
 use crate::args::{Command, VmRun};
@@ -30,6 +31,11 @@ pub fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
         } => bench_whp(iterations, map_mib, out.as_deref()),
         Command::VmRun(options) => vm_run(&options),
         Command::InputCheck { profile } => input_check(&profile),
+        Command::Launch => {
+            crate::app::run()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::UiPreview { out } => ui_preview(&out),
         Command::Help | Command::Version => unreachable!("handled in main"),
     }
 }
@@ -165,6 +171,17 @@ struct VmRunResult {
     run: Report,
 }
 
+fn ui_preview(path: &str) -> Result<ExitCode, Box<dyn Error>> {
+    let mut launcher = rax_ui::Launcher::new(rax_ui::Settings::default(), true);
+    let pixels = launcher.draw().ok_or("nothing was drawn")?;
+    let screen = Framebuffer {
+        width: rax_ui::UI_WIDTH as u16,
+        height: rax_ui::UI_HEIGHT as u16,
+    };
+    std::fs::write(path, screen.to_bmp(pixels))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn input_check(path: &str) -> Result<ExitCode, Box<dyn Error>> {
     let text =
         std::fs::read_to_string(path).map_err(|error| format!("could not read {path}: {error}"))?;
@@ -177,6 +194,30 @@ fn input_check(path: &str) -> Result<ExitCode, Box<dyn Error>> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Parses lines of `SECONDS move DX DY`, `SECONDS buttons MASK`, or
+/// `SECONDS key SCANCODE down|up`, so input can be tested with nobody present.
+fn parse_input_script(text: &str) -> Result<Vec<(Duration, GuestInput)>, Box<dyn Error>> {
+    let mut script = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let event = match words.as_slice() {
+            [_, "move", dx, dy] => GuestInput::MouseMove {
+                dx: dx.parse()?,
+                dy: dy.parse()?,
+            },
+            [_, "buttons", mask] => GuestInput::MouseButtons(mask.parse()?),
+            [_, "key", code, state] => GuestInput::Key {
+                scancode: u8::from_str_radix(code, 16)?,
+                extended: false,
+                down: *state == "down",
+            },
+            _ => return Err(format!("bad input script line: {line}").into()),
+        };
+        script.push((Duration::from_secs_f64(words[0].parse()?), event));
+    }
+    Ok(script)
+}
+
 fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
     let read =
         |path: &str| std::fs::read(path).map_err(|error| format!("could not read {path}: {error}"));
@@ -186,13 +227,18 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         ram_mib: options.ram_mib,
         timeout: Duration::from_secs(options.timeout_secs as u64),
         shell: options.shell,
-        disk: options.disk.as_ref().map(PathBuf::from),
+        disks: options.disks.iter().map(PathBuf::from).collect(),
         init_script: None,
         own_init_cmdline: options.cmdline.clone(),
         framebuffer: options
             .framebuffer
             .map(|(width, height)| Framebuffer { width, height }),
         screenshot: options.screenshot.as_ref().map(PathBuf::from),
+        display: None,
+        input_script: match &options.input_script {
+            Some(path) => parse_input_script(&std::fs::read_to_string(path)?)?,
+            None => Vec::new(),
+        },
     })?;
     eprintln!(
         "\nguest stopped: {:?}, user space after {} ms, {} exits, {} interrupts",

@@ -29,6 +29,13 @@ pub enum Command {
         /// Path to the profile.
         profile: String,
     },
+    /// Open the launcher.
+    Launch,
+    /// Save the launcher screen as a BMP.
+    UiPreview {
+        /// Output file.
+        out: String,
+    },
     /// Print usage.
     Help,
     /// Print the version.
@@ -50,21 +57,27 @@ pub struct VmRun {
     pub shell: bool,
     /// File to write the JSON report to.
     pub report: Option<String>,
-    /// Raw disk image for the guest.
-    pub disk: Option<String>,
+    /// Raw disk images for the guest. The option may repeat.
+    pub disks: Vec<String>,
     /// Boot the guest's own init with this command line.
     pub cmdline: Option<String>,
     /// Screen size, as `(width, height)`.
     pub framebuffer: Option<(u16, u16)>,
     /// File to save the screen to.
     pub screenshot: Option<String>,
+    /// File of timed input for repeatable tests.
+    pub input_script: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
 pub fn parse(args: &[String]) -> Result<Command, String> {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
-        [] | ["help" | "-h" | "--help"] => Ok(Command::Help),
+        [] => Ok(Command::Launch),
+        ["help" | "-h" | "--help"] => Ok(Command::Help),
+        ["ui", "preview", out] => Ok(Command::UiPreview {
+            out: (*out).to_owned(),
+        }),
         ["version" | "-V" | "--version"] => Ok(Command::Version),
         ["doctor"] => Ok(Command::Doctor { json: false }),
         ["doctor", "--json"] => Ok(Command::Doctor { json: true }),
@@ -107,10 +120,11 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut timeout_secs = DEFAULT_VM_TIMEOUT_SECS;
     let mut shell = false;
     let mut report = None;
-    let mut disk = None;
+    let mut disks = Vec::new();
     let mut cmdline = None;
     let mut framebuffer = None;
     let mut screenshot = None;
+    let mut input_script = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -126,10 +140,11 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--ram-mib" => ram_mib = positive(option, value)?,
             "--timeout-secs" => timeout_secs = positive(option, value)?,
             "--report" => report = Some((*value).to_owned()),
-            "--disk" => disk = Some((*value).to_owned()),
+            "--disk" => disks.push((*value).to_owned()),
             "--cmdline" => cmdline = Some((*value).to_owned()),
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
             "--screenshot" => screenshot = Some((*value).to_owned()),
+            "--input-script" => input_script = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -140,10 +155,11 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         timeout_secs,
         shell,
         report,
-        disk,
+        disks,
         cmdline,
         framebuffer,
         screenshot,
+        input_script,
     }))
 }
 
@@ -172,8 +188,9 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_prints_help() {
-        assert_eq!(run(&[]), Ok(Command::Help));
+    fn no_arguments_opens_the_launcher() {
+        assert_eq!(run(&[]), Ok(Command::Launch));
+        assert_eq!(run(&["--help"]), Ok(Command::Help));
     }
 
     #[test]
@@ -245,10 +262,11 @@ mod tests {
                 timeout_secs: DEFAULT_VM_TIMEOUT_SECS,
                 shell: true,
                 report: None,
-                disk: None,
+                disks: Vec::new(),
                 cmdline: None,
                 framebuffer: None,
                 screenshot: None,
+                input_script: None,
             }))
         );
     }

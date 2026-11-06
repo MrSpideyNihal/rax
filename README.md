@@ -5,9 +5,15 @@
 
 **A research project to build the lightest practical Android gaming runtime for Windows, in Rust.**
 
-> **Status: Android 9 boots on RAX's own VM, with software rendering. No game runs yet, and there is no touch input, network, or GPU acceleration.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
+> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. Rendering is software only, and there is no network or GPU acceleration, so no game runs yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
+
+![The RAX launcher](docs/images/launcher.png)
 
 ## What exists
+
+Run `rax.exe` with no arguments to open the launcher. Everything stays in one folder: delete it and RAX is gone, with nothing left in the registry or AppData. Android keeps your apps in `data.img` in that folder, and dragging an `.apk` onto the window installs it. The app is about 0.7 MB, and the launcher uses about 17 MB of RAM.
+
+**Google Play is not included.** It is licensed by Google, so RAX cannot ship it, and RAX has no network yet in any case.
 
 | Command | What it does |
 |---|---|
@@ -43,7 +49,16 @@ cargo run --release -p rax-cli -- doctor
 cargo run --release -p rax-cli -- bench whp
 ```
 
-To boot Linux, download the verified test guest first. It is too large to keep in Git:
+To run Android, fetch the verified image into `guest/`, then open the launcher:
+
+```powershell
+./scripts/fetch-android.ps1
+cargo run --release -p rax-cli
+```
+
+`./scripts/make-portable.ps1` builds the single folder.
+
+To boot Linux instead, download the verified test guest first. It is too large to keep in Git:
 
 ```powershell
 ./scripts/fetch-guest.ps1

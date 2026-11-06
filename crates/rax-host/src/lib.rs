@@ -15,5 +15,6 @@ pub mod stats;
 pub mod vm;
 pub mod vulkan;
 pub mod whp;
+pub mod window;
 
 pub use error::{Error, Result};

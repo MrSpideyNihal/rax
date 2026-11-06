@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "rax-host",
  "rax-input",
+ "rax-ui",
  "rax-vmm",
  "serde",
  "serde_json",
@@ -57,6 +58,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "rax-ui"
+version = "0.1.0"
 
 [[package]]
 name = "rax-vmm"

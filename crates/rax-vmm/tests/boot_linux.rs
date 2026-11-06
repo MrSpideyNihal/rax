@@ -48,11 +48,13 @@ fn user_space_output_survives_repeated_boots() {
             ram_mib: 512,
             timeout: Duration::from_secs(30),
             shell: false,
-            disk: None,
+            disks: Vec::new(),
             init_script: None,
             own_init_cmdline: None,
             framebuffer: None,
             screenshot: None,
+            display: None,
+            input_script: Vec::new(),
         })
         .expect("guest runs");
         assert_eq!(report.outcome, Outcome::PoweredOff, "attempt {attempt}");
@@ -96,11 +98,13 @@ fn guest_reads_and_writes_the_disk() {
         ram_mib: 512,
         timeout: Duration::from_secs(30),
         shell: false,
-        disk: Some(path.clone()),
+        disks: vec![path.clone()],
         init_script: Some(COPY_SECTOR_SCRIPT.to_owned()),
         own_init_cmdline: None,
         framebuffer: None,
         screenshot: None,
+        display: None,
+        input_script: Vec::new(),
     })
     .expect("guest runs");
 
