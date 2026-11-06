@@ -24,8 +24,9 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 
 | Item | Status |
 |---|---|
-| Android boot | Not started |
-| ART | Not started |
+| Android 9 (Android-x86 9.0-r2) init and text shell | **Tested once**: 1536 MiB, one vCPU, about 90 processes, `logd` and `servicemanager` running |
+| Full Android boot | **Fails**: `surfaceflinger` and `zygote` keep restarting, and `sys.boot_completed` is never set |
+| ART and apps | Not reached |
 | Hardware OpenGL ES | Not started |
 | Hardware Vulkan | Not started |
 

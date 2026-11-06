@@ -13,7 +13,7 @@ use rax_host::vm::{self, Kicker, Vm};
 use rax_host::whp::{Api, VmExit};
 use serde::Serialize;
 
-use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA};
+use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
 use crate::serial::Sink;
@@ -68,6 +68,9 @@ pub struct Config {
     pub disk: Option<PathBuf>,
     /// Replaces the built-in init script.
     pub init_script: Option<String>,
+    /// Boots the guest's own init with this command line, leaving its
+    /// initramfs untouched. Used for full operating systems such as Android.
+    pub own_init_cmdline: Option<String>,
 }
 
 /// How the guest stopped.
@@ -382,14 +385,19 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let mut initrd = config.initrd;
     let built_in = if config.shell { SHELL_INIT } else { SMOKE_INIT };
     let script = config.init_script.as_deref().unwrap_or(built_in);
-    cpio::concatenate(
-        &mut initrd,
-        &cpio::single_executable(INIT_PATH, script.as_bytes()),
-    );
+    if config.own_init_cmdline.is_none() {
+        cpio::concatenate(
+            &mut initrd,
+            &cpio::single_executable(INIT_PATH, script.as_bytes()),
+        );
+    }
     let initrd_gpa = kernel.initrd_address(initrd.len(), ram_bytes)?;
 
     let disk = config.disk.as_ref().map(open_disk).transpose()?;
-    let cmdline = command_line(&api, disk.is_some());
+    let cmdline = config
+        .own_init_cmdline
+        .clone()
+        .unwrap_or_else(|| command_line(&api, disk.is_some()));
 
     let vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
     vm.write_ram(kernel.load_address(), kernel.payload())?;
@@ -397,7 +405,14 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     vm.write_ram(CMDLINE_GPA, &boot::cmdline_bytes(&cmdline)?)?;
     let params = kernel.boot_params(ram_bytes, Some((initrd_gpa, initrd.len())))?;
     vm.write_ram(BOOT_PARAMS_GPA, &params)?;
-    vm.enter_protected_mode(kernel.load_address(), BOOT_PARAMS_GPA)?;
+    let gdt = boot::gdt_bytes();
+    vm.write_ram(GDT_GPA, &gdt)?;
+    vm.enter_protected_mode(
+        kernel.load_address(),
+        BOOT_PARAMS_GPA,
+        GDT_GPA,
+        gdt.len() as u16,
+    )?;
 
     let ready = Arc::new(Mutex::new(None));
     let console = Console {

@@ -7,6 +7,12 @@ use std::fmt;
 
 /// Where `boot_params` (the "zero page") is placed.
 pub const BOOT_PARAMS_GPA: u64 = 0x7000;
+/// Where the boot GDT is placed.
+pub const GDT_GPA: u64 = 0x6000;
+/// The GDT the boot protocol requires, with flat 4 GiB segments at the
+/// selectors it names: `__BOOT_CS` at 0x10 and `__BOOT_DS` at 0x18. Older
+/// kernels load these before setting up their own table.
+pub const BOOT_GDT: [u64; 4] = [0, 0, 0x00cf_9b00_0000_ffff, 0x00cf_9300_0000_ffff];
 /// Where the command line is placed.
 pub const CMDLINE_GPA: u64 = 0x2_0000;
 /// Largest command line RAX will pass.
@@ -223,6 +229,15 @@ impl<'a> BzImage<'a> {
     }
 }
 
+/// The boot GDT as bytes for guest memory.
+#[must_use]
+pub fn gdt_bytes() -> Vec<u8> {
+    BOOT_GDT
+        .iter()
+        .flat_map(|entry| entry.to_le_bytes())
+        .collect()
+}
+
 /// Returns `cmdline` as the NUL-terminated bytes the kernel expects.
 pub fn cmdline_bytes(cmdline: &str) -> Result<Vec<u8>, BootError> {
     if cmdline.len() >= CMDLINE_MAX {
@@ -352,6 +367,14 @@ mod tests {
             kernel.initrd_address(0x100_0000, 0x300_0000),
             Err(BootError::RamTooSmall { .. })
         ));
+    }
+
+    #[test]
+    fn gdt_has_the_protocol_selectors() {
+        let bytes = gdt_bytes();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(read_u64(&bytes, 0x10), 0x00cf_9b00_0000_ffff, "__BOOT_CS");
+        assert_eq!(read_u64(&bytes, 0x18), 0x00cf_9300_0000_ffff, "__BOOT_DS");
     }
 
     #[test]

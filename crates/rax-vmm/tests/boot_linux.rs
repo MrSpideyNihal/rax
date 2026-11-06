@@ -50,6 +50,7 @@ fn user_space_output_survives_repeated_boots() {
             shell: false,
             disk: None,
             init_script: None,
+            own_init_cmdline: None,
         })
         .expect("guest runs");
         assert_eq!(report.outcome, Outcome::PoweredOff, "attempt {attempt}");
@@ -95,6 +96,7 @@ fn guest_reads_and_writes_the_disk() {
         shell: false,
         disk: Some(path.clone()),
         init_script: Some(COPY_SECTOR_SCRIPT.to_owned()),
+        own_init_cmdline: None,
     })
     .expect("guest runs");
 

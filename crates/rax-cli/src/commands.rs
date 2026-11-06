@@ -187,6 +187,7 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         shell: options.shell,
         disk: options.disk.as_ref().map(PathBuf::from),
         init_script: None,
+        own_init_cmdline: options.cmdline.clone(),
     })?;
     eprintln!(
         "\nguest stopped: {:?}, user space after {} ms, {} exits, {} interrupts",

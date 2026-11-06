@@ -57,8 +57,15 @@ impl<'a> Vm<'a> {
 
     /// Enters 32-bit protected mode with flat segments at `entry`, with `rsi`
     /// pointing at the boot parameters, as the Linux boot protocol requires.
-    pub fn enter_protected_mode(&self, entry: u64, rsi: u64) -> Result<()> {
-        self.partition.enter_protected_mode(entry, rsi)
+    pub fn enter_protected_mode(
+        &self,
+        entry: u64,
+        rsi: u64,
+        gdt_gpa: u64,
+        gdt_bytes: u16,
+    ) -> Result<()> {
+        self.partition
+            .enter_protected_mode(entry, rsi, gdt_gpa, gdt_bytes)
     }
 
     /// Runs the vCPU until the next exit.

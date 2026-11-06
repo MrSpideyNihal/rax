@@ -52,6 +52,8 @@ pub struct VmRun {
     pub report: Option<String>,
     /// Raw disk image for the guest.
     pub disk: Option<String>,
+    /// Boot the guest's own init with this command line.
+    pub cmdline: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
@@ -102,6 +104,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut shell = false;
     let mut report = None;
     let mut disk = None;
+    let mut cmdline = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -118,6 +121,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--timeout-secs" => timeout_secs = positive(option, value)?,
             "--report" => report = Some((*value).to_owned()),
             "--disk" => disk = Some((*value).to_owned()),
+            "--cmdline" => cmdline = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -129,6 +133,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         shell,
         report,
         disk,
+        cmdline,
     }))
 }
 
@@ -223,6 +228,7 @@ mod tests {
                 shell: true,
                 report: None,
                 disk: None,
+                cmdline: None,
             }))
         );
     }

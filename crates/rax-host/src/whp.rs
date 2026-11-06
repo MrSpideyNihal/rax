@@ -37,6 +37,7 @@ const REG_SS: u32 = 0x14;
 const REG_DS: u32 = 0x15;
 const REG_FS: u32 = 0x16;
 const REG_GS: u32 = 0x17;
+const REG_GDTR: u32 = 0x1b;
 const REG_CR0: u32 = 0x1c;
 const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
 const REG_DELIVERABILITY: u32 = 0x8000_0004;
@@ -449,6 +450,12 @@ const SELECTOR_CODE: u64 = 0x10;
 const SELECTOR_DATA: u64 = 0x18;
 const SEGMENT_LIMIT_4G: u64 = 0xffff_ffff;
 
+/// `WHV_X64_TABLE_REGISTER`: padding, limit, then base. The limit is the last
+/// valid byte, so one less than the size.
+fn table_register(base: u64, size_bytes: u16) -> RegisterValue {
+    RegisterValue([u64::from(size_bytes - 1) << 48, base])
+}
+
 fn flat_segment(selector: u64, attributes: u64) -> RegisterValue {
     RegisterValue([0, SEGMENT_LIMIT_4G | selector << 32 | attributes << 48])
 }
@@ -570,14 +577,21 @@ impl Partition<'_> {
         check("WHvMapGpaRange", hr)
     }
 
-    pub(crate) fn enter_protected_mode(&self, entry: u64, rsi: u64) -> Result<()> {
+    pub(crate) fn enter_protected_mode(
+        &self,
+        entry: u64,
+        rsi: u64,
+        gdt_gpa: u64,
+        gdt_bytes: u16,
+    ) -> Result<()> {
         let data = flat_segment(SELECTOR_DATA, SEGMENT_DATA_ATTRIBUTES);
         self.set_registers(
             &[
-                REG_CS, REG_DS, REG_ES, REG_SS, REG_FS, REG_GS, REG_CR0, REG_RIP, REG_RFLAGS,
-                REG_RSI,
+                REG_GDTR, REG_CS, REG_DS, REG_ES, REG_SS, REG_FS, REG_GS, REG_CR0, REG_RIP,
+                REG_RFLAGS, REG_RSI,
             ],
             &[
+                table_register(gdt_gpa, gdt_bytes),
                 flat_segment(SELECTOR_CODE, SEGMENT_CODE_ATTRIBUTES),
                 data,
                 data,
@@ -807,6 +821,13 @@ mod tests {
             merge_rax(0x1122_3344_5566_7788, 4, 0xdead_beef),
             0xdead_beef
         );
+    }
+
+    #[test]
+    fn table_registers_hold_a_limit_and_a_base() {
+        let RegisterValue([limit, base]) = table_register(0x6000, 32);
+        assert_eq!(limit >> 48, 31);
+        assert_eq!(base, 0x6000);
     }
 
     #[test]
