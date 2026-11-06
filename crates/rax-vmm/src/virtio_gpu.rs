@@ -10,6 +10,7 @@
 //! already runs after the one it guards, on the same OpenGL stream.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use rax_host::virgl::{Renderer, ResourceArgs, Transfer, TransferBox};
 
@@ -168,6 +169,20 @@ pub struct GpuStats {
     pub submits: u64,
     /// Frames the guest presented.
     pub flushes: u64,
+    /// Milliseconds the guest waited on command buffers.
+    pub submit_ms: u64,
+    /// Milliseconds the guest waited on copies to the host.
+    pub to_host_ms: u64,
+    /// Milliseconds the guest waited on copies from the host.
+    pub from_host_ms: u64,
+    /// Milliseconds the guest waited on creating resources.
+    pub create_ms: u64,
+    /// Milliseconds the guest waited on everything else.
+    pub other_ms: u64,
+    /// Longest single request, in milliseconds.
+    pub longest_ms: u64,
+    /// Milliseconds spent copying frames for the window.
+    pub present_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +253,18 @@ pub struct VirtioGpu {
     frame_waiting: bool,
     irq_requested: bool,
     stats: GpuStats,
+    timing: Timing,
+}
+
+/// Time spent in each kind of request, in microseconds.
+#[derive(Debug, Clone, Copy, Default)]
+struct Timing {
+    submit: u64,
+    to_host: u64,
+    from_host: u64,
+    create: u64,
+    other: u64,
+    present: u64,
 }
 
 impl VirtioGpu {
@@ -253,6 +280,7 @@ impl VirtioGpu {
             frame_waiting: false,
             irq_requested: false,
             stats: GpuStats::default(),
+            timing: Timing::default(),
         }
     }
 
@@ -281,7 +309,15 @@ impl VirtioGpu {
     /// Activity counters.
     #[must_use]
     pub fn stats(&self) -> GpuStats {
-        self.stats
+        GpuStats {
+            submit_ms: self.timing.submit / 1000,
+            to_host_ms: self.timing.to_host / 1000,
+            from_host_ms: self.timing.from_host / 1000,
+            create_ms: self.timing.create / 1000,
+            other_ms: self.timing.other / 1000,
+            present_ms: self.timing.present / 1000,
+            ..self.stats
+        }
     }
 
     /// Handles a read of the device's memory.
@@ -355,7 +391,9 @@ impl VirtioGpu {
         let fields = Fields(request);
         self.stats.commands += 1;
         backend.prepare();
+        let started = Instant::now();
         let answer = self.dispatch(&fields, backend);
+        self.record(fields.word(0).unwrap_or(0), started.elapsed());
         if answer.is_none() {
             self.stats.errors += 1;
         }
@@ -515,6 +553,26 @@ impl VirtioGpu {
             }
             _ => None,
         }
+    }
+
+    fn record(&mut self, kind: u32, took: Duration) {
+        let millis = took.as_millis() as u64;
+        // Short requests round to nothing, so count in microseconds here.
+        let micros = took.as_micros() as u64;
+        self.stats.longest_ms = self.stats.longest_ms.max(millis);
+        let total = match kind {
+            CMD_SUBMIT_3D => &mut self.timing.submit,
+            CMD_TRANSFER_TO_HOST_2D | CMD_TRANSFER_TO_HOST_3D => &mut self.timing.to_host,
+            CMD_TRANSFER_FROM_HOST_3D => &mut self.timing.from_host,
+            CMD_RESOURCE_CREATE_2D | CMD_RESOURCE_CREATE_3D => &mut self.timing.create,
+            _ => &mut self.timing.other,
+        };
+        *total += micros;
+    }
+
+    /// Notes time spent copying a frame for the window.
+    pub fn record_present(&mut self, took: Duration) {
+        self.timing.present += took.as_micros() as u64;
     }
 
     fn create(&mut self, args: ResourceArgs, backend: &mut dyn Backend) -> Answer {
@@ -1099,6 +1157,35 @@ mod tests {
         gpu.write(0x14, 0);
         assert_eq!(gpu.scanout(), None);
         assert_eq!(gpu.read(0x1c, 2), 0);
+    }
+
+    #[test]
+    fn time_is_sorted_by_kind_of_request() {
+        let mut gpu = VirtioGpu::new(640, 480);
+        gpu.record(CMD_SUBMIT_3D, Duration::from_millis(5));
+        gpu.record(CMD_TRANSFER_TO_HOST_3D, Duration::from_millis(3));
+        gpu.record(CMD_GET_CAPSET, Duration::from_millis(1));
+        gpu.record_present(Duration::from_millis(2));
+        let stats = gpu.stats();
+        assert_eq!(
+            (
+                stats.submit_ms,
+                stats.to_host_ms,
+                stats.other_ms,
+                stats.present_ms
+            ),
+            (5, 3, 1, 2)
+        );
+        assert_eq!(stats.longest_ms, 5);
+    }
+
+    #[test]
+    fn many_short_requests_still_add_up() {
+        let mut gpu = VirtioGpu::new(640, 480);
+        for _ in 0..2000 {
+            gpu.record(CMD_SUBMIT_3D, Duration::from_micros(500));
+        }
+        assert_eq!(gpu.stats().submit_ms, 1000);
     }
 
     #[test]

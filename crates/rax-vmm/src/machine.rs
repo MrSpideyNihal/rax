@@ -454,6 +454,13 @@ struct Gpu<'vm> {
 impl Gpu<'_> {
     /// Reads what is on screen into `pixels`, as BGRX.
     fn read_screen(&mut self) -> Option<Scanout> {
+        let started = Instant::now();
+        let shown = self.copy_screen();
+        self.device.record_present(started.elapsed());
+        shown
+    }
+
+    fn copy_screen(&mut self) -> Option<Scanout> {
         let screen = self.device.scanout()?;
         let bytes = screen.width as usize * screen.height as usize * 4;
         self.pixels.resize(bytes, 0);
