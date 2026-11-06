@@ -74,6 +74,9 @@ fn to_ui(x: i32, y: i32, client: (i32, i32)) -> (i32, i32) {
 pub fn run() -> Result<(), Box<dyn Error>> {
     window::hide_own_console();
     let root = find_root();
+    // A crash can leave these behind, and neither holds anything of value.
+    let _ = std::fs::remove_file(root.join(INBOX));
+    let _ = std::fs::remove_file(root.join("data.tmp"));
     let settings_path = root.join(SETTINGS_FILE);
     let settings = std::fs::read_to_string(&settings_path)
         .map(|text| Settings::parse(&text))
@@ -112,9 +115,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         if let Some(pixels) = launcher.draw() {
                             window.present(pixels, UI_WIDTH, UI_HEIGHT);
                         }
-                        prepare_data_disk(&mut window, &root)?;
                     }
-                    let outcome = session(&mut window, &root, settings);
+                    let prepared = if root.join(DATA).is_file() {
+                        Ok(())
+                    } else {
+                        prepare_data_disk(&mut window, &root)
+                    };
+                    let outcome = prepared.and_then(|()| session(&mut window, &root, settings));
                     window.set_title("RAX");
                     launcher.set_status(outcome.err().map(|error| error.to_string()));
                 }

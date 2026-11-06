@@ -32,6 +32,8 @@ const NO_PCI: &str = " pci=off";
 const TIMER_IDLE: Duration = Duration::from_millis(1);
 /// How often the screen is copied for a live window.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How often a sleeping guest checks for a request to stop.
+const HALT_POLL: Duration = Duration::from_millis(50);
 /// Console text kept for a running app, in bytes.
 const CONSOLE_KEEP: usize = 16 * 1024;
 
@@ -300,6 +302,28 @@ fn spawn_stdin_reader() -> Receiver<Vec<u8>> {
     receiver
 }
 
+/// Waits for an interrupt while the guest sleeps. The wait is short and
+/// repeated, so a request to stop is seen even if no interrupt ever comes.
+fn wait_while_halted(shared: &Shared, deadline: Instant) -> Result<(), &'static str> {
+    let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+    loop {
+        let stopping = shared
+            .display
+            .as_ref()
+            .is_some_and(|display| display.stop.load(Ordering::Relaxed));
+        let now = Instant::now();
+        if stopping || now >= deadline || bus.pending_vector().is_some() || bus.reset_requested() {
+            return Ok(());
+        }
+        let wait = deadline.saturating_duration_since(now).min(HALT_POLL);
+        bus = shared
+            .wake
+            .wait_timeout(bus, wait)
+            .map_err(|_| "device lock poisoned")?
+            .0;
+    }
+}
+
 /// Guest RAM for devices. Only used while the vCPU is stopped at an exit.
 struct RamView<'a, 'b>(&'a Vm<'b>);
 
@@ -422,14 +446,7 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                         window_exits,
                     });
                 }
-                let bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
-                let wait = deadline.saturating_duration_since(Instant::now());
-                let (_bus, _) = shared
-                    .wake
-                    .wait_timeout_while(bus, wait, |bus| {
-                        bus.pending_vector().is_none() && !bus.reset_requested()
-                    })
-                    .map_err(|_| "device lock poisoned")?;
+                wait_while_halted(shared, deadline)?;
             }
             VmExit::InterruptWindow => window_exits += 1,
             VmExit::Canceled => {}
