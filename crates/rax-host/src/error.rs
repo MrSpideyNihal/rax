@@ -50,6 +50,13 @@ pub enum Error {
         /// Guest instruction pointer at the exit.
         rip: u64,
     },
+    /// A write to guest memory fell outside mapped RAM.
+    GuestRange {
+        /// Guest physical address.
+        gpa: u64,
+        /// Length of the access.
+        len: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -76,6 +83,9 @@ impl fmt::Display for Error {
                     f,
                     "guest exited unexpectedly: reason {reason:#x} at rip {rip:#x}"
                 )
+            }
+            Self::GuestRange { gpa, len } => {
+                write!(f, "{len} bytes at {gpa:#x} is outside guest RAM")
             }
         }
     }

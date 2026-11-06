@@ -2,15 +2,16 @@
 
 use std::error::Error;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rax_host::assess::{self, Finding, Probes, Severity};
 use rax_host::host::{self, HostInfo};
 use rax_host::vulkan::{self, Device};
 use rax_host::whp::{self, Capabilities, ExitLatency, MapCost};
+use rax_vmm::machine::{self, Config, Outcome, Report};
 use serde::Serialize;
 
-use crate::args::Command;
+use crate::args::{Command, VmRun};
 
 const EXIT_BLOCKED: u8 = 2;
 /// Bump when a benchmark result field changes meaning.
@@ -25,6 +26,7 @@ pub fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             map_mib,
             out,
         } => bench_whp(iterations, map_mib, out.as_deref()),
+        Command::VmRun(options) => vm_run(&options),
         Command::Help | Command::Version => unreachable!("handled in main"),
     }
 }
@@ -147,4 +149,60 @@ fn bench_whp(
         eprintln!("warning: debug build, numbers are not representative");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Serialize)]
+struct VmRunResult {
+    schema_version: u32,
+    benchmark: &'static str,
+    rax_version: &'static str,
+    profile: &'static str,
+    captured_at_unix: u64,
+    host: HostInfo,
+    run: Report,
+}
+
+fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
+    let read =
+        |path: &str| std::fs::read(path).map_err(|error| format!("could not read {path}: {error}"));
+    let report = machine::run(Config {
+        kernel: read(&options.kernel)?,
+        initrd: read(&options.initrd)?,
+        ram_mib: options.ram_mib,
+        timeout: Duration::from_secs(options.timeout_secs as u64),
+        shell: options.shell,
+    })?;
+    eprintln!(
+        "\nguest stopped: {:?}, user space after {} ms, {} exits, {} interrupts",
+        report.outcome,
+        report
+            .boot_to_user_space_ms
+            .map_or_else(|| "never".to_owned(), |ms| format!("{ms:.0}")),
+        report.vcpu_exits,
+        report.interrupts
+    );
+    if let Some(path) = &options.report {
+        let result = VmRunResult {
+            schema_version: RESULT_SCHEMA_VERSION,
+            benchmark: "vm-boot",
+            rax_version: env!("CARGO_PKG_VERSION"),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            captured_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            host: host::probe()?,
+            run: report.clone(),
+        };
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&result)?),
+        )?;
+    }
+    Ok(if report.outcome == Outcome::TimedOut {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }

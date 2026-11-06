@@ -2,6 +2,8 @@
 
 const DEFAULT_ITERATIONS: usize = 200_000;
 const DEFAULT_MAP_MIB: usize = 1024;
+const DEFAULT_VM_RAM_MIB: usize = 512;
+const DEFAULT_VM_TIMEOUT_SECS: usize = 60;
 
 /// A parsed invocation.
 #[derive(Debug, PartialEq, Eq)]
@@ -20,10 +22,29 @@ pub enum Command {
         /// File to write the JSON result to.
         out: Option<String>,
     },
+    /// Boot a Linux guest.
+    VmRun(VmRun),
     /// Print usage.
     Help,
     /// Print the version.
     Version,
+}
+
+/// Options for `rax vm run`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VmRun {
+    /// Path to a `bzImage`.
+    pub kernel: String,
+    /// Path to an initramfs.
+    pub initrd: String,
+    /// Guest RAM in MiB.
+    pub ram_mib: usize,
+    /// Stop the guest after this many seconds.
+    pub timeout_secs: usize,
+    /// Attach stdin to a guest shell.
+    pub shell: bool,
+    /// File to write the JSON report to.
+    pub report: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
@@ -35,6 +56,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         ["doctor"] => Ok(Command::Doctor { json: false }),
         ["doctor", "--json"] => Ok(Command::Doctor { json: true }),
         ["bench", "whp", options @ ..] => parse_bench(options),
+        ["vm", "run", options @ ..] => parse_vm_run(options),
         [other, ..] => Err(format!("unknown command or option: {other}")),
     }
 }
@@ -60,6 +82,41 @@ fn parse_bench(options: &[&str]) -> Result<Command, String> {
         map_mib,
         out,
     })
+}
+
+fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
+    let mut kernel = None;
+    let mut initrd = None;
+    let mut ram_mib = DEFAULT_VM_RAM_MIB;
+    let mut timeout_secs = DEFAULT_VM_TIMEOUT_SECS;
+    let mut shell = false;
+    let mut report = None;
+    let mut rest = options.iter();
+    while let Some(option) = rest.next() {
+        if *option == "--shell" {
+            shell = true;
+            continue;
+        }
+        let value = rest
+            .next()
+            .ok_or_else(|| format!("{option} needs a value"))?;
+        match *option {
+            "--kernel" => kernel = Some((*value).to_owned()),
+            "--initrd" => initrd = Some((*value).to_owned()),
+            "--ram-mib" => ram_mib = positive(option, value)?,
+            "--timeout-secs" => timeout_secs = positive(option, value)?,
+            "--report" => report = Some((*value).to_owned()),
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    Ok(Command::VmRun(VmRun {
+        kernel: kernel.ok_or("--kernel is required")?,
+        initrd: initrd.ok_or("--initrd is required")?,
+        ram_mib,
+        timeout_secs,
+        shell,
+        report,
+    }))
 }
 
 fn positive(option: &str, value: &str) -> Result<usize, String> {
@@ -122,6 +179,37 @@ mod tests {
                 map_mib: 7,
                 out: Some("r.json".to_owned())
             })
+        );
+    }
+
+    #[test]
+    fn vm_run_needs_a_kernel_and_initrd() {
+        assert!(run(&["vm", "run"]).is_err());
+        assert!(run(&["vm", "run", "--kernel", "k"]).is_err());
+    }
+
+    #[test]
+    fn vm_run_parses_flags_and_values() {
+        assert_eq!(
+            run(&[
+                "vm",
+                "run",
+                "--shell",
+                "--kernel",
+                "k",
+                "--initrd",
+                "i",
+                "--ram-mib",
+                "256"
+            ]),
+            Ok(Command::VmRun(VmRun {
+                kernel: "k".to_owned(),
+                initrd: "i".to_owned(),
+                ram_mib: 256,
+                timeout_secs: DEFAULT_VM_TIMEOUT_SECS,
+                shell: true,
+                report: None,
+            }))
         );
     }
 

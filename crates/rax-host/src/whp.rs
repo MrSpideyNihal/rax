@@ -14,25 +14,40 @@ use crate::dylib::Library;
 use crate::stats::{self, Summary};
 use crate::{Error, Result};
 
-type Handle = *mut c_void;
+pub(crate) type Handle = *mut c_void;
 type Hresult = i32;
 
 const CAP_HYPERVISOR_PRESENT: u32 = 0x0000;
 const CAP_FEATURES: u32 = 0x0001;
 const CAP_PROCESSOR_VENDOR: u32 = 0x1000;
+const CAP_PROCESSOR_CLOCK: u32 = 0x1004;
 const PROP_PROCESSOR_COUNT: u32 = 0x1fff;
 
 const MAP_READ: u32 = 0x1;
 const MAP_WRITE: u32 = 0x2;
 const MAP_EXECUTE: u32 = 0x4;
 
+const REG_RAX: u32 = 0x00;
+const REG_RSI: u32 = 0x06;
 const REG_RIP: u32 = 0x10;
 const REG_RFLAGS: u32 = 0x11;
+const REG_ES: u32 = 0x12;
 const REG_CS: u32 = 0x13;
+const REG_SS: u32 = 0x14;
+const REG_DS: u32 = 0x15;
+const REG_FS: u32 = 0x16;
+const REG_GS: u32 = 0x17;
+const REG_CR0: u32 = 0x1c;
+const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
+const REG_DELIVERABILITY: u32 = 0x8000_0004;
 
+const EXIT_MEMORY: u32 = 0x0001;
 const EXIT_IO_PORT: u32 = 0x0002;
+const EXIT_INTERRUPT_WINDOW: u32 = 0x0007;
+const EXIT_HALT: u32 = 0x0008;
+const EXIT_CANCELED: u32 = 0x2001;
 
-const PAGE: usize = 0x1000;
+pub(crate) const PAGE: usize = 0x1000;
 const GUEST_CODE_GPA: u64 = 0x1000;
 /// `out 0x10, al` followed by `jmp` back to it.
 const GUEST_CODE: [u8; 4] = [0xE6, 0x10, 0xEB, 0xFC];
@@ -90,6 +105,7 @@ pub struct Api {
     run_virtual_processor: unsafe extern "system" fn(Handle, u32, *mut c_void, u32) -> Hresult,
     get_registers:
         unsafe extern "system" fn(Handle, u32, *const u32, u32, *mut RegisterValue) -> Hresult,
+    cancel_run: unsafe extern "system" fn(Handle, u32, u32) -> Hresult,
     set_registers:
         unsafe extern "system" fn(Handle, u32, *const u32, u32, *const RegisterValue) -> Hresult,
     // Never moved out, so the pointers above stay valid for the lifetime of `Api`.
@@ -117,6 +133,7 @@ impl Api {
                 run_virtual_processor: library.symbol(c"WHvRunVirtualProcessor")?,
                 get_registers: library.symbol(c"WHvGetVirtualProcessorRegisters")?,
                 set_registers: library.symbol(c"WHvSetVirtualProcessorRegisters")?,
+                cancel_run: library.symbol(c"WHvCancelRunVirtualProcessor")?,
                 _library: library,
             })
         }
@@ -177,13 +194,13 @@ fn check(api: &'static str, hr: Hresult) -> Result<()> {
 }
 
 /// A partition (virtual machine) deleted on drop.
-struct Partition<'a> {
+pub(crate) struct Partition<'a> {
     api: &'a Api,
     handle: Handle,
 }
 
 impl<'a> Partition<'a> {
-    fn new(api: &'a Api, processors: u32) -> Result<Self> {
+    pub(crate) fn new(api: &'a Api, processors: u32) -> Result<Self> {
         let mut handle: Handle = std::ptr::null_mut();
         // SAFETY: `handle` is a valid out pointer.
         check("WHvCreatePartition", unsafe {
@@ -233,7 +250,7 @@ impl<'a> Partition<'a> {
         })
     }
 
-    fn create_processor(&self, index: u32) -> Result<()> {
+    pub(crate) fn create_processor(&self, index: u32) -> Result<()> {
         // SAFETY: the handle is live and the index is below the configured count.
         let hr = unsafe { (self.api.create_virtual_processor)(self.handle, index, 0) };
         check("WHvCreateVirtualProcessor", hr)
@@ -282,13 +299,13 @@ impl Drop for Partition<'_> {
 }
 
 /// Page-aligned, zero-initialised host memory for a guest.
-struct GuestRegion {
+pub(crate) struct GuestRegion {
     base: NonNull<c_void>,
     size: usize,
 }
 
 impl GuestRegion {
-    fn new(size: usize) -> Result<Self> {
+    pub(crate) fn new(size: usize) -> Result<Self> {
         // SAFETY: a null address asks the OS to choose one, and no existing
         // memory is affected.
         let raw = unsafe {
@@ -329,6 +346,281 @@ impl Drop for GuestRegion {
         unsafe {
             VirtualFree(self.base.as_ptr(), 0, MEM_RELEASE);
         }
+    }
+}
+
+impl GuestRegion {
+    /// Copies `bytes` to offset `gpa`, checking bounds.
+    pub(crate) fn write_at(&mut self, gpa: u64, bytes: &[u8]) -> Result<()> {
+        let offset = crate::vm::check_range(gpa, bytes.len(), self.size)?;
+        // SAFETY: `check_range` proved the destination lies inside this
+        // allocation, `self` is exclusively borrowed so the vCPU API cannot
+        // be running through `Vm`, and the source cannot overlap it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.base.as_ptr().cast::<u8>().add(offset),
+                bytes.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Registers captured at a vCPU exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuState {
+    /// Instruction pointer of the exiting instruction.
+    pub rip: u64,
+    /// Flags at the exit.
+    pub rflags: u64,
+}
+
+/// Why the vCPU stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmExit {
+    /// `in` from a port.
+    PortRead {
+        /// Port number.
+        port: u16,
+        /// Access size in bytes.
+        size: u8,
+    },
+    /// `out` to a port.
+    PortWrite {
+        /// Port number.
+        port: u16,
+        /// Access size in bytes.
+        size: u8,
+        /// Low bytes of RAX.
+        value: u32,
+    },
+    /// The guest executed `hlt`.
+    Halted,
+    /// The guest can now accept an interrupt.
+    InterruptWindow,
+    /// Another thread kicked the vCPU.
+    Canceled,
+    /// An access outside mapped RAM.
+    Mmio {
+        /// Guest physical address.
+        gpa: u64,
+        /// Whether it was a write.
+        write: bool,
+    },
+    /// Anything else, including string I/O.
+    Other {
+        /// `WHV_RUN_VP_EXIT_REASON`.
+        reason: u32,
+    },
+}
+
+/// A decoded exit.
+#[derive(Debug, Clone, Copy)]
+pub struct ExitInfo {
+    /// Why the vCPU stopped.
+    pub exit: VmExit,
+    /// Registers at the exit.
+    pub cpu: CpuState,
+    /// Whether an external interrupt can be injected now.
+    pub interruptible: bool,
+    instruction_length: u8,
+    rax: u64,
+}
+
+const RFLAGS_IF: u64 = 1 << 9;
+const EXEC_INTERRUPTION_PENDING: u16 = 1 << 6;
+const EXEC_INTERRUPT_SHADOW: u16 = 1 << 12;
+const IO_INFO_WRITE: u32 = 1;
+const IO_INFO_STRING: u32 = 1 << 4;
+const CR0_PE_ET: u64 = 0x11;
+const SEGMENT_CODE_ATTRIBUTES: u64 = 0xC09B;
+const SEGMENT_DATA_ATTRIBUTES: u64 = 0xC093;
+const SELECTOR_CODE: u64 = 0x10;
+const SELECTOR_DATA: u64 = 0x18;
+const SEGMENT_LIMIT_4G: u64 = 0xffff_ffff;
+
+fn flat_segment(selector: u64, attributes: u64) -> RegisterValue {
+    RegisterValue([0, SEGMENT_LIMIT_4G | selector << 32 | attributes << 48])
+}
+
+fn little_u16(data: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([data[at], data[at + 1]])
+}
+
+fn little_u32(data: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+}
+
+fn little_u64(data: &[u8], at: usize) -> u64 {
+    let low = u64::from(little_u32(data, at));
+    low | u64::from(little_u32(data, at + 4)) << 32
+}
+
+/// Decodes `WHV_X64_IO_PORT_ACCESS_CONTEXT`.
+fn decode_io(data: &[u8]) -> (VmExit, u64) {
+    let info = little_u32(data, 20);
+    let port = little_u16(data, 24);
+    let rax = little_u64(data, 32);
+    let size = ((info >> 1) & 0x7) as u8;
+    if info & IO_INFO_STRING != 0 {
+        return (
+            VmExit::Other {
+                reason: EXIT_IO_PORT,
+            },
+            rax,
+        );
+    }
+    let exit = if info & IO_INFO_WRITE != 0 {
+        VmExit::PortWrite {
+            port,
+            size,
+            value: rax as u32,
+        }
+    } else {
+        VmExit::PortRead { port, size }
+    };
+    (exit, rax)
+}
+
+/// Stores `value` in the low `size` bytes of `rax`, as `in` does. A 32-bit
+/// access clears the upper half, as every 32-bit register write does.
+fn merge_rax(rax: u64, size: u8, value: u32) -> u64 {
+    match size {
+        1 => (rax & !0xff) | u64::from(value & 0xff),
+        2 => (rax & !0xffff) | u64::from(value & 0xffff),
+        _ => u64::from(value),
+    }
+}
+
+/// Runs vCPU 0 until the next exit and decodes it.
+pub(crate) fn read_exit(partition: &Partition<'_>) -> Result<ExitInfo> {
+    // SAFETY: ExitContext is plain integers, so all-zero is a valid value.
+    let mut exit: ExitContext = unsafe { std::mem::zeroed() };
+    partition.run(&mut exit)?;
+    let mut rax = 0;
+    let decoded = match exit.reason {
+        EXIT_IO_PORT => {
+            let (decoded, value) = decode_io(&exit.union_data);
+            rax = value;
+            decoded
+        }
+        EXIT_HALT => VmExit::Halted,
+        EXIT_INTERRUPT_WINDOW => VmExit::InterruptWindow,
+        EXIT_CANCELED => VmExit::Canceled,
+        EXIT_MEMORY => VmExit::Mmio {
+            gpa: little_u64(&exit.union_data, 24),
+            write: little_u32(&exit.union_data, 20) & 0x3 == 1,
+        },
+        reason => VmExit::Other { reason },
+    };
+    let blocked = exit.execution_state & (EXEC_INTERRUPTION_PENDING | EXEC_INTERRUPT_SHADOW) != 0;
+    Ok(ExitInfo {
+        exit: decoded,
+        cpu: CpuState {
+            rip: exit.rip,
+            rflags: exit.rflags,
+        },
+        interruptible: exit.rflags & RFLAGS_IF != 0 && !blocked,
+        instruction_length: exit.instruction_length_cr8 & 0x0f,
+        rax,
+    })
+}
+
+/// Maps `ram` at guest address zero.
+///
+/// `Vm` declares its partition before its RAM, which is what makes this
+/// sound without the borrow that [`Partition::map`] normally demands.
+pub(crate) fn map_guest_ram(partition: &Partition<'_>, ram: &GuestRegion) -> Result<()> {
+    partition.map_unchecked(ram, 0, MAP_READ | MAP_WRITE | MAP_EXECUTE)
+}
+
+/// Maps `region` read-only at `gpa`, with the same lifetime rule as
+/// [`map_guest_ram`].
+pub(crate) fn map_read_only(
+    partition: &Partition<'_>,
+    region: &GuestRegion,
+    gpa: u64,
+) -> Result<()> {
+    partition.map_unchecked(region, gpa, MAP_READ)
+}
+
+impl Partition<'_> {
+    fn map_unchecked(&self, region: &GuestRegion, gpa: u64, flags: u32) -> Result<()> {
+        // SAFETY: `region` is a live, page-aligned allocation of `size`
+        // bytes. The caller keeps it alive until the partition is deleted.
+        let hr = unsafe {
+            (self.api.map_gpa_range)(
+                self.handle,
+                region.base.as_ptr(),
+                gpa,
+                region.size as u64,
+                flags,
+            )
+        };
+        check("WHvMapGpaRange", hr)
+    }
+
+    pub(crate) fn enter_protected_mode(&self, entry: u64, rsi: u64) -> Result<()> {
+        let data = flat_segment(SELECTOR_DATA, SEGMENT_DATA_ATTRIBUTES);
+        self.set_registers(
+            &[
+                REG_CS, REG_DS, REG_ES, REG_SS, REG_FS, REG_GS, REG_CR0, REG_RIP, REG_RFLAGS,
+                REG_RSI,
+            ],
+            &[
+                flat_segment(SELECTOR_CODE, SEGMENT_CODE_ATTRIBUTES),
+                data,
+                data,
+                data,
+                data,
+                data,
+                RegisterValue([CR0_PE_ET, 0]),
+                RegisterValue([entry, 0]),
+                RegisterValue([RFLAGS_RESET, 0]),
+                RegisterValue([rsi, 0]),
+            ],
+        )
+    }
+
+    pub(crate) fn skip_instruction(&self, info: &ExitInfo) -> Result<()> {
+        let rip = info.cpu.rip + u64::from(info.instruction_length);
+        self.set_registers(&[REG_RIP], &[RegisterValue([rip, 0])])
+    }
+
+    pub(crate) fn finish_port_read(&self, info: &ExitInfo, size: u8, value: u32) -> Result<()> {
+        let rip = info.cpu.rip + u64::from(info.instruction_length);
+        self.set_registers(
+            &[REG_RAX, REG_RIP],
+            &[
+                RegisterValue([merge_rax(info.rax, size, value), 0]),
+                RegisterValue([rip, 0]),
+            ],
+        )
+    }
+
+    pub(crate) fn inject_interrupt(&self, vector: u8) -> Result<()> {
+        // WHV_X64_PENDING_INTERRUPTION_REGISTER: pending bit, type 0
+        // (external interrupt), vector at bit 16.
+        let pending = 1 | u64::from(vector) << 16;
+        self.set_registers(&[REG_PENDING_INTERRUPTION], &[RegisterValue([pending, 0])])
+    }
+
+    pub(crate) fn request_interrupt_window(&self) -> Result<()> {
+        // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: InterruptNotification.
+        self.set_registers(&[REG_DELIVERABILITY], &[RegisterValue([1 << 1, 0])])
+    }
+
+    pub(crate) fn cancel_parts(
+        &self,
+    ) -> (unsafe extern "system" fn(Handle, u32, u32) -> i32, Handle) {
+        (self.api.cancel_run, self.handle)
+    }
+}
+
+impl Api {
+    pub(crate) fn processor_clock_hz(&self) -> Result<u64> {
+        self.capability(CAP_PROCESSOR_CLOCK)
     }
 }
 
@@ -451,6 +743,70 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ExitContext, rip), 32);
         assert_eq!(std::mem::offset_of!(ExitContext, rflags), 40);
         assert_eq!(std::mem::offset_of!(ExitContext, union_data), 48);
+    }
+
+    fn io_context(info: u32, port: u16, rax: u64) -> [u8; 176] {
+        let mut data = [0_u8; 176];
+        data[20..24].copy_from_slice(&info.to_le_bytes());
+        data[24..26].copy_from_slice(&port.to_le_bytes());
+        data[32..40].copy_from_slice(&rax.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn decodes_a_byte_write() {
+        let (exit, _) = decode_io(&io_context(0b0011, 0x3f8, 0x41));
+        assert_eq!(
+            exit,
+            VmExit::PortWrite {
+                port: 0x3f8,
+                size: 1,
+                value: 0x41
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_a_dword_read() {
+        let (exit, _) = decode_io(&io_context(0b1000, 0xcf8, 0));
+        assert_eq!(
+            exit,
+            VmExit::PortRead {
+                port: 0xcf8,
+                size: 4
+            }
+        );
+    }
+
+    #[test]
+    fn string_io_is_not_treated_as_a_plain_access() {
+        let (exit, _) = decode_io(&io_context(0b1_0011, 0x3f8, 0));
+        assert!(matches!(exit, VmExit::Other { .. }));
+    }
+
+    #[test]
+    fn port_reads_merge_into_rax_like_the_hardware() {
+        assert_eq!(
+            merge_rax(0x1122_3344_5566_7788, 1, 0xab),
+            0x1122_3344_5566_77ab
+        );
+        assert_eq!(
+            merge_rax(0x1122_3344_5566_7788, 2, 0xabcd),
+            0x1122_3344_5566_abcd
+        );
+        assert_eq!(
+            merge_rax(0x1122_3344_5566_7788, 4, 0xdead_beef),
+            0xdead_beef
+        );
+    }
+
+    #[test]
+    fn flat_segments_encode_selector_and_attributes() {
+        let RegisterValue([base, rest]) = flat_segment(0x10, 0xC09B);
+        assert_eq!(base, 0);
+        assert_eq!(rest as u32, 0xffff_ffff);
+        assert_eq!((rest >> 32) as u16, 0x10);
+        assert_eq!((rest >> 48) as u16, 0xC09B);
     }
 
     #[test]
