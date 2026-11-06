@@ -10,7 +10,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rax_host::vm::{self, Kicker, Vm};
-use rax_host::whp::{Api, VmExit};
+use rax_host::whp::{Api, ExitInfo, VmExit};
+use rax_input::Touch;
 use rax_net::host::Network;
 use rax_net::nat::GUEST_MAC;
 use serde::Serialize;
@@ -19,9 +20,11 @@ use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
 use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
+use crate::mmio;
 use crate::ps2::GuestInput;
 use crate::serial::Sink;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
+use crate::virtio_input::VirtioInput;
 use crate::virtio_net::VirtioNet;
 
 /// Printed by the guest once user space is running.
@@ -89,10 +92,14 @@ pub struct Config {
     pub screenshot: Option<PathBuf>,
     /// Gives the guest a network card, with internet through this network.
     pub network: Option<Network>,
+    /// Gives the guest a multi-touch screen.
+    pub touchscreen: bool,
     /// Connects a live window. `None` runs headless.
     pub display: Option<Display>,
     /// Timed input, for repeatable tests with no person at the keyboard.
     pub input_script: Vec<(Duration, GuestInput)>,
+    /// Timed touches, for repeatable tests.
+    pub touch_script: Vec<(Duration, Touch)>,
 }
 
 /// The link between the VM thread and a window on another thread.
@@ -104,6 +111,8 @@ pub struct Display {
     pub input: Arc<Mutex<Vec<GuestInput>>>,
     /// Set to shut the guest down.
     pub stop: Arc<AtomicBool>,
+    /// Finger changes from the key mapper.
+    pub touches: Arc<Mutex<Vec<Touch>>>,
     /// Text to type into the guest's console.
     pub console_input: Arc<Mutex<Vec<u8>>>,
     /// What the console has printed, newest last.
@@ -118,6 +127,7 @@ impl Display {
             frame: Arc::new(Mutex::new(vec![0; size_bytes])),
             input: Arc::new(Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
+            touches: Arc::new(Mutex::new(Vec::new())),
             console_input: Arc::new(Mutex::new(Vec::new())),
             console_output: Arc::new(Mutex::new(String::new())),
         }
@@ -231,15 +241,20 @@ struct Shared {
     started: Instant,
     display: Option<Display>,
     input_script: Vec<(Duration, GuestInput)>,
+    touch_script: Vec<(Duration, Touch)>,
+    /// Set when touches are waiting to reach guest memory.
+    touch_ready: AtomicBool,
     /// Set when the network has frames waiting for the guest.
     network_ready: Option<Arc<AtomicBool>>,
 }
 
 impl Shared {
     fn network_pending(&self) -> bool {
-        self.network_ready
-            .as_ref()
-            .is_some_and(|ready| ready.load(Ordering::Relaxed))
+        self.touch_ready.load(Ordering::Relaxed)
+            || self
+                .network_ready
+                .as_ref()
+                .is_some_and(|ready| ready.load(Ordering::Relaxed))
     }
 }
 
@@ -251,6 +266,7 @@ impl Shared {
 
 fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<u8>>>) {
     let mut script_position = 0;
+    let mut touch_position = 0;
     while !shared.stop.load(Ordering::Relaxed) {
         let now = shared.now_ns();
         let window_input: Vec<GuestInput> = shared
@@ -263,6 +279,26 @@ fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<
         };
         for event in window_input {
             bus.guest_input(event);
+        }
+        let mut touched = false;
+        if let Some(display) = &shared.display
+            && let Ok(mut touches) = display.touches.lock()
+        {
+            touched = !touches.is_empty();
+            for touch in touches.drain(..) {
+                bus.touch_input(touch);
+            }
+        }
+        while let Some((at, touch)) = shared.touch_script.get(touch_position) {
+            if u128::from(now) < at.as_nanos() {
+                break;
+            }
+            bus.touch_input(*touch);
+            touch_position += 1;
+            touched = true;
+        }
+        if touched {
+            shared.touch_ready.store(true, Ordering::Relaxed);
         }
         if let Some(display) = &shared.display
             && let Ok(mut typed) = display.console_input.lock()
@@ -353,6 +389,46 @@ impl GuestMemory for RamView<'_, '_> {
     }
 }
 
+/// Performs a guest access to device memory.
+fn device_memory(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    info: &ExitInfo,
+    gpa: u64,
+    bytes: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let access = mmio::decode(bytes)
+        .ok_or_else(|| format!("cannot decode device access {bytes:02x?} at {gpa:#x}"))?;
+    let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+    if access.write {
+        let value = match access.immediate {
+            Some(value) => value,
+            None => {
+                let register = vm.general_register(access.register)? as u32;
+                match access.size {
+                    1 => register & 0xff,
+                    2 => register & 0xffff,
+                    _ => register,
+                }
+            }
+        };
+        bus.memory_write(gpa, value);
+        bus.service_devices(&RamView(vm));
+        vm.advance(info, access.length)?;
+    } else {
+        let value = bus.memory_read(gpa, access.size);
+        vm.finish_load(
+            info,
+            access.register,
+            access.size,
+            value,
+            access.zero_extend,
+            access.length,
+        )?;
+    }
+    Ok(())
+}
+
 /// What to do about interrupts before the vCPU next runs.
 #[derive(Debug, PartialEq, Eq)]
 enum Delivery {
@@ -411,9 +487,12 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
         }
         {
             let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
-            if let Some(ready) = &shared.network_ready
-                && ready.swap(false, Ordering::Relaxed)
-            {
+            let touched = shared.touch_ready.swap(false, Ordering::Relaxed);
+            let frames = shared
+                .network_ready
+                .as_ref()
+                .is_some_and(|ready| ready.swap(false, Ordering::Relaxed));
+            if touched || frames {
                 bus.service_devices(&RamView(vm));
             }
             if bus.reset_requested() {
@@ -471,13 +550,29 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
             }
             VmExit::InterruptWindow => window_exits += 1,
             VmExit::Canceled => {}
-            VmExit::Mmio { gpa, write: false } => {
+            VmExit::Mmio {
+                gpa,
+                instruction,
+                instruction_bytes,
+                ..
+            } if shared
+                .bus
+                .lock()
+                .map_err(|_| "device lock poisoned")?
+                .owns_memory(gpa) =>
+            {
+                let bytes = &instruction[..usize::from(instruction_bytes)];
+                device_memory(vm, shared, &info, gpa, bytes)?;
+            }
+            VmExit::Mmio {
+                gpa, write: false, ..
+            } => {
                 // Linux probes for chipset registers that this machine does
                 // not have, and expects all ones when nothing answers.
                 vm.map_floating_page(gpa)?;
                 floating_pages += 1;
             }
-            VmExit::Mmio { gpa, write } => {
+            VmExit::Mmio { gpa, write, .. } => {
                 return Err(format!(
                     "guest {} unmapped address {gpa:#x} at {:?}",
                     if write { "wrote" } else { "read" },
@@ -599,12 +694,20 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let started = Instant::now();
     let deadline = started + config.timeout;
     let shared = Shared {
-        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds, disks, card)),
+        bus: Mutex::new(Bus::new(
+            Box::new(console),
+            unix_seconds,
+            disks,
+            card,
+            config.touchscreen.then(VirtioInput::default),
+        )),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,
         display: config.display.clone(),
         input_script: config.input_script.clone(),
+        touch_script: config.touch_script.clone(),
+        touch_ready: AtomicBool::new(false),
         network_ready,
     };
     let kicker = vm.kicker();

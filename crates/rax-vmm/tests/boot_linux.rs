@@ -54,8 +54,10 @@ fn user_space_output_survives_repeated_boots() {
             framebuffer: None,
             screenshot: None,
             network: None,
+            touchscreen: false,
             display: None,
             input_script: Vec::new(),
+            touch_script: Vec::new(),
         })
         .expect("guest runs");
         assert_eq!(report.outcome, Outcome::PoweredOff, "attempt {attempt}");
@@ -105,8 +107,10 @@ fn guest_reads_and_writes_the_disk() {
         framebuffer: None,
         screenshot: None,
         network: None,
+        touchscreen: false,
         display: None,
         input_script: Vec::new(),
+        touch_script: Vec::new(),
     })
     .expect("guest runs");
 

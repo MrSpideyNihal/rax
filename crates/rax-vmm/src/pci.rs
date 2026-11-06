@@ -3,17 +3,23 @@
 //! There is a host bridge at device 0 and one virtio block device at device
 //! 1. Each has a 256-byte configuration header.
 
+use crate::virtio_input::{
+    BAR_SIZE, COMMON_LENGTH, COMMON_OFFSET, DEVICE_LENGTH, DEVICE_OFFSET, ISR_OFFSET, NOTIFY_OFFSET,
+};
+
 const ENABLE_BIT: u32 = 0x8000_0000;
 const HEADER_SIZE: usize = 256;
 
 const REG_VENDOR: usize = 0x00;
 const REG_DEVICE: usize = 0x02;
 const REG_COMMAND: usize = 0x04;
+const REG_STATUS: usize = 0x06;
 const REG_REVISION: usize = 0x08;
 const REG_CLASS: usize = 0x0a;
 const REG_BAR0: usize = 0x10;
 const REG_SUBSYSTEM_VENDOR: usize = 0x2c;
 const REG_SUBSYSTEM: usize = 0x2e;
+const REG_CAPABILITIES: usize = 0x34;
 const REG_INTERRUPT_LINE: usize = 0x3c;
 const REG_INTERRUPT_PIN: usize = 0x3d;
 
@@ -34,6 +40,21 @@ const CLASS_ETHERNET: u16 = 0x0200;
 const REVISION_LEGACY: u8 = 0;
 
 const COMMAND_IO_ENABLE: u16 = 0x0001;
+const COMMAND_MEMORY_ENABLE: u16 = 0x0002;
+const STATUS_HAS_CAPABILITIES: u16 = 0x0010;
+const CAPABILITY_VENDOR: u8 = 0x09;
+const CAPABILITY_START: usize = 0x40;
+/// Modern virtio input device, 0x1040 plus its type of 18.
+const DEVICE_VIRTIO_INPUT: u16 = 0x1052;
+const SUBSYSTEM_VIRTIO_INPUT: u16 = 0x0100;
+const CLASS_OTHER_INPUT: u16 = 0x0980;
+const REVISION_MODERN: u8 = 1;
+const CFG_COMMON: u8 = 1;
+const CFG_NOTIFY: u8 = 2;
+const CFG_ISR: u8 = 3;
+const CFG_DEVICE: u8 = 4;
+/// Where the touchscreen's registers sit, in the gap above the framebuffer.
+const INPUT_BAR_DEFAULT: u32 = 0xfe00_0000;
 const BAR_IO_SPACE: u32 = 0x0001;
 /// Size of the virtio register window, in I/O ports.
 const VIRTIO_BAR_SIZE: u32 = 0x40;
@@ -64,20 +85,60 @@ fn host_bridge_header() -> [u8; HEADER_SIZE] {
 enum Kind {
     Block,
     Net,
+    Input,
+}
+
+/// Builds the capability list that locates a modern device's registers.
+fn write_capabilities(header: &mut [u8; HEADER_SIZE]) {
+    let regions: [(u8, u32, u32, u8); 4] = [
+        (CFG_COMMON, COMMON_OFFSET as u32, COMMON_LENGTH, 16),
+        (CFG_NOTIFY, NOTIFY_OFFSET as u32, 4, 20),
+        (CFG_ISR, ISR_OFFSET as u32, 4, 16),
+        (CFG_DEVICE, DEVICE_OFFSET as u32, DEVICE_LENGTH, 16),
+    ];
+    let mut at = CAPABILITY_START;
+    put_u16(header, REG_STATUS, STATUS_HAS_CAPABILITIES);
+    header[REG_CAPABILITIES] = at as u8;
+    for (index, (kind, offset, length, size)) in regions.into_iter().enumerate() {
+        let next = at + usize::from(size);
+        header[at] = CAPABILITY_VENDOR;
+        header[at + 1] = if index == regions.len() - 1 {
+            0
+        } else {
+            next as u8
+        };
+        header[at + 2] = size;
+        header[at + 3] = kind;
+        header[at + 4] = 0; // BAR 0.
+        put_u32(header, at + 8, offset);
+        put_u32(header, at + 12, length);
+        at = next;
+    }
 }
 
 fn virtio_header(index: usize, kind: Kind) -> [u8; HEADER_SIZE] {
     let (device, subsystem, class) = match kind {
         Kind::Block => (DEVICE_VIRTIO_BLK, SUBSYSTEM_VIRTIO_BLK, CLASS_MASS_STORAGE),
         Kind::Net => (DEVICE_VIRTIO_NET, SUBSYSTEM_VIRTIO_NET, CLASS_ETHERNET),
+        Kind::Input => (
+            DEVICE_VIRTIO_INPUT,
+            SUBSYSTEM_VIRTIO_INPUT,
+            CLASS_OTHER_INPUT,
+        ),
     };
     let mut header = [0; HEADER_SIZE];
     put_u16(&mut header, REG_VENDOR, VENDOR_VIRTIO);
     put_u16(&mut header, REG_DEVICE, device);
     header[REG_REVISION] = REVISION_LEGACY;
     put_u16(&mut header, REG_CLASS, class);
-    let bar = VIRTIO_BAR_DEFAULT + index as u32 * VIRTIO_BAR_SIZE;
-    put_u32(&mut header, REG_BAR0, bar | BAR_IO_SPACE);
+    if kind == Kind::Input {
+        header[REG_REVISION] = REVISION_MODERN;
+        put_u32(&mut header, REG_BAR0, INPUT_BAR_DEFAULT);
+        write_capabilities(&mut header);
+    } else {
+        let bar = VIRTIO_BAR_DEFAULT + index as u32 * VIRTIO_BAR_SIZE;
+        put_u32(&mut header, REG_BAR0, bar | BAR_IO_SPACE);
+    }
     put_u16(&mut header, REG_SUBSYSTEM_VENDOR, VENDOR_VIRTIO);
     put_u16(&mut header, REG_SUBSYSTEM, subsystem);
     header[REG_INTERRUPT_LINE] = VIRTIO_IRQ;
@@ -92,16 +153,20 @@ pub struct Pci {
     host_bridge: [u8; HEADER_SIZE],
     /// One header per disk, at devices 1 and up.
     virtio: Vec<[u8; HEADER_SIZE]>,
+    /// Index in `virtio` of the touchscreen, if any.
+    input: Option<usize>,
 }
 
 impl Pci {
     /// Creates the bus with one virtio device per disk, then the network
     /// card if there is one.
     #[must_use]
-    pub fn new(disks: usize, network: bool) -> Self {
+    pub fn new(disks: usize, network: bool, touch: bool) -> Self {
         let kinds = (0..disks)
             .map(|_| Kind::Block)
-            .chain(network.then_some(Kind::Net));
+            .chain(network.then_some(Kind::Net))
+            .chain(touch.then_some(Kind::Input));
+        let input = touch.then_some(disks + usize::from(network));
         Self {
             address: 0,
             host_bridge: host_bridge_header(),
@@ -109,6 +174,7 @@ impl Pci {
                 .enumerate()
                 .map(|(index, kind)| virtio_header(index, kind))
                 .collect(),
+            input,
         }
     }
 
@@ -170,6 +236,9 @@ impl Pci {
         };
         match (register, size) {
             (REG_COMMAND, 2 | 4) => put_u16(header, REG_COMMAND, value as u16),
+            (REG_BAR0, 4) if Some(device as usize - 1) == self.input => {
+                put_u32(header, REG_BAR0, value & !(BAR_SIZE - 1));
+            }
             (REG_BAR0, 4) => {
                 let address = value & !(VIRTIO_BAR_SIZE - 1);
                 put_u32(header, REG_BAR0, address | BAR_IO_SPACE);
@@ -177,6 +246,25 @@ impl Pci {
             (REG_INTERRUPT_LINE, 1 | 2 | 4) => header[REG_INTERRUPT_LINE] = value as u8,
             _ => {}
         }
+    }
+
+    /// Finds the touchscreen register a memory address belongs to. Addresses
+    /// decode only after the guest enables memory on the device.
+    #[must_use]
+    pub fn input_offset(&self, gpa: u64) -> Option<u64> {
+        let header = self.virtio.get(self.input?)?;
+        let command = u16::from_le_bytes([header[REG_COMMAND], header[REG_COMMAND + 1]]);
+        if command & COMMAND_MEMORY_ENABLE == 0 {
+            return None;
+        }
+        let base = u64::from(u32::from_le_bytes([
+            header[REG_BAR0],
+            header[REG_BAR0 + 1],
+            header[REG_BAR0 + 2],
+            header[REG_BAR0 + 3],
+        ]));
+        let offset = gpa.checked_sub(base)?;
+        (offset < u64::from(BAR_SIZE)).then_some(offset)
     }
 
     /// Finds the disk and register a port belongs to. Ports decode only
@@ -221,21 +309,21 @@ mod tests {
 
     #[test]
     fn address_port_reads_back_for_the_kernel_probe() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         pci.write_address(0x8000_0000);
         assert_eq!(pci.read_address(), 0x8000_0000);
     }
 
     #[test]
     fn the_host_bridge_identifies_itself() {
-        let mut pci = Pci::new(0, false);
+        let mut pci = Pci::new(0, false, false);
         assert_eq!(read(&mut pci, 0, 0, 2), u32::from(VENDOR_REDHAT));
         assert_eq!(read(&mut pci, 0, 0x0a, 2), u32::from(CLASS_HOST_BRIDGE));
     }
 
     #[test]
     fn virtio_identifies_as_a_legacy_block_device() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         assert_eq!(
             read(&mut pci, 1, 0, 4),
             u32::from(DEVICE_VIRTIO_BLK) << 16 | u32::from(VENDOR_VIRTIO)
@@ -248,15 +336,15 @@ mod tests {
 
     #[test]
     fn empty_slots_read_all_ones() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         assert_eq!(read(&mut pci, 2, 0, 4), u32::MAX);
-        let mut without_disk = Pci::new(0, false);
+        let mut without_disk = Pci::new(0, false, false);
         assert_eq!(read(&mut without_disk, 1, 0, 4), u32::MAX);
     }
 
     #[test]
     fn other_buses_and_functions_are_empty() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         pci.write_address(ENABLE_BIT | 1 << 16);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
         pci.write_address(ENABLE_BIT | 1 << 8);
@@ -265,21 +353,21 @@ mod tests {
 
     #[test]
     fn a_disabled_address_reads_nothing() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         pci.write_address(0);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
     }
 
     #[test]
     fn bar_sizing_reports_the_window_size() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         write(&mut pci, 1, 0x10, 4, u32::MAX);
         assert_eq!(read(&mut pci, 1, 0x10, 4), 0xffff_ffc1);
     }
 
     #[test]
     fn registers_decode_only_after_io_is_enabled() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         assert_eq!(pci.virtio_offset(0xc040), None);
         write(&mut pci, 1, 0x04, 2, 1);
         assert_eq!(pci.virtio_offset(0xc040), Some((0, 0)));
@@ -290,7 +378,7 @@ mod tests {
 
     #[test]
     fn a_moved_bar_moves_the_window() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         write(&mut pci, 1, 0x04, 2, 1);
         write(&mut pci, 1, 0x10, 4, 0xd000);
         assert_eq!(pci.virtio_offset(0xd010), Some((0, 0x10)));
@@ -299,7 +387,7 @@ mod tests {
 
     #[test]
     fn each_disk_gets_its_own_slot_and_window() {
-        let mut pci = Pci::new(2, false);
+        let mut pci = Pci::new(2, false, false);
         assert_eq!(read(&mut pci, 2, 0, 2), u32::from(VENDOR_VIRTIO));
         assert_eq!(read(&mut pci, 3, 0, 4), u32::MAX);
         write(&mut pci, 1, 0x04, 2, 1);
@@ -309,8 +397,41 @@ mod tests {
     }
 
     #[test]
+    fn the_touchscreen_is_modern_and_has_capabilities() {
+        let mut pci = Pci::new(0, false, true);
+        assert_eq!(read(&mut pci, 1, 0x02, 2), u32::from(DEVICE_VIRTIO_INPUT));
+        assert_eq!(read(&mut pci, 1, 0x08, 1), u32::from(REVISION_MODERN));
+        assert_ne!(
+            read(&mut pci, 1, 0x06, 2) & u32::from(STATUS_HAS_CAPABILITIES),
+            0
+        );
+        let mut at = read(&mut pci, 1, 0x34, 1);
+        let mut kinds = Vec::new();
+        while at != 0 {
+            assert_eq!(read(&mut pci, 1, at, 1), u32::from(CAPABILITY_VENDOR));
+            kinds.push(read(&mut pci, 1, at + 3, 1) as u8);
+            at = read(&mut pci, 1, at + 1, 1);
+        }
+        assert_eq!(kinds, [CFG_COMMON, CFG_NOTIFY, CFG_ISR, CFG_DEVICE]);
+    }
+
+    #[test]
+    fn touchscreen_memory_sizes_and_decodes() {
+        let mut pci = Pci::new(0, false, true);
+        assert_eq!(pci.input_offset(u64::from(INPUT_BAR_DEFAULT)), None);
+        write(&mut pci, 1, 0x10, 4, u32::MAX);
+        assert_eq!(read(&mut pci, 1, 0x10, 4), !(BAR_SIZE - 1));
+        write(&mut pci, 1, 0x10, 4, INPUT_BAR_DEFAULT);
+        write(&mut pci, 1, 0x04, 2, 2);
+        let base = u64::from(INPUT_BAR_DEFAULT);
+        assert_eq!(pci.input_offset(base + 0x14), Some(0x14));
+        assert_eq!(pci.input_offset(base + u64::from(BAR_SIZE)), None);
+        assert_eq!(pci.input_offset(base - 1), None);
+    }
+
+    #[test]
     fn the_network_card_follows_the_disks() {
-        let mut pci = Pci::new(1, true);
+        let mut pci = Pci::new(1, true, false);
         assert_eq!(read(&mut pci, 2, 0x02, 2), u32::from(DEVICE_VIRTIO_NET));
         assert_eq!(read(&mut pci, 2, 0x0a, 2), u32::from(CLASS_ETHERNET));
         assert_eq!(read(&mut pci, 2, 0x2e, 2), u32::from(SUBSYSTEM_VIRTIO_NET));
@@ -318,7 +439,7 @@ mod tests {
 
     #[test]
     fn identity_registers_cannot_be_overwritten() {
-        let mut pci = Pci::new(1, false);
+        let mut pci = Pci::new(1, false, false);
         write(&mut pci, 1, 0, 4, 0);
         assert_eq!(read(&mut pci, 1, 0, 2), u32::from(VENDOR_VIRTIO));
     }

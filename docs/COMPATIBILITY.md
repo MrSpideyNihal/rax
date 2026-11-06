@@ -28,7 +28,9 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 | Android 9 (Android-x86 9.0-r2) full boot | **Tested**: 2 GB, one vCPU, `sys.boot_completed` set, setup screen drawn |
 | ART and system apps | **Tested**: `system_server` and the setup wizard run |
 | Mouse and keyboard in Android | **Tested**: a scripted click pressed the setup button |
-| Multi-finger touch and key mapping in Android | Not connected |
+| Multi-finger touch in Android | **Tested**: a scripted tap pressed a setup button, and Android logged two tracked fingers at once |
+| Key mapping, window to mapper | Unit tested |
+| Key mapping with a real keyboard in a real app | **Not tested** |
 | Internet in Android | **Tested**: Android reported validated Ethernet with no setup, and its WebView loaded an HTTPS site |
 | Download speed | **Not measured** |
 | IPv6, ICMP beyond the router | Not implemented |
@@ -49,7 +51,7 @@ Goals, not support claims. See [ADR-0007](ADR/0007-game-goals-and-input.md).
 | Runs on RAX | **Not tested** | **Not tested, and blocked** |
 | Native x86 build | Not confirmed | None listed, `arm64-v8a` only |
 | Emulator rules | Reported separate pool and leaderboard exclusion | Reported banned from competitive events |
-| Key mapping | Engine tested alone, positions not set | Engine tested alone, positions not set |
+| Key mapping | Connected, positions not set | Connected, positions not set |
 
 Your account carries the risk of following or breaking each game's rules. RAX does not hide from anti-cheat, and has no macros.
 

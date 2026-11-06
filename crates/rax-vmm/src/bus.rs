@@ -11,7 +11,9 @@ use crate::ps2::{GuestInput, Ps2, Ps2Irq};
 use crate::rtc::Rtc;
 use crate::serial::{Serial, Sink};
 use crate::virtio_blk::{GuestMemory, VirtioBlk};
+use crate::virtio_input::VirtioInput;
 use crate::virtio_net::VirtioNet;
+use rax_input::Touch;
 
 const IRQ_TIMER: u8 = 0;
 const IRQ_KEYBOARD: u8 = 1;
@@ -79,6 +81,7 @@ pub struct Bus {
     pci: Pci,
     disks: Vec<VirtioBlk>,
     network: Option<VirtioNet>,
+    touch: Option<VirtioInput>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -92,6 +95,7 @@ impl Bus {
         wall_clock: fn() -> u64,
         disks: Vec<VirtioBlk>,
         network: Option<VirtioNet>,
+        touch: Option<VirtioInput>,
     ) -> Self {
         Self {
             pic: Pic::default(),
@@ -101,9 +105,10 @@ impl Bus {
             wall_clock,
             serial: Serial::new(console),
             ps2: Ps2::default(),
-            pci: Pci::new(disks.len(), network.is_some()),
+            pci: Pci::new(disks.len(), network.is_some(), touch.is_some()),
             disks,
             network,
+            touch,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
@@ -292,8 +297,40 @@ impl Bus {
             raise |= card.take_irq();
             (self.stats.frames_in, self.stats.frames_out) = card.frame_counts();
         }
+        if let Some(screen) = self.touch.as_mut() {
+            screen.service(memory);
+            raise |= screen.take_irq();
+        }
         if raise {
             self.pic.raise(VIRTIO_IRQ);
+        }
+    }
+
+    /// Whether a memory address belongs to a device.
+    #[must_use]
+    pub fn owns_memory(&self, gpa: u64) -> bool {
+        self.pci.input_offset(gpa).is_some()
+    }
+
+    /// Handles a device memory load.
+    pub fn memory_read(&mut self, gpa: u64, size: u8) -> u32 {
+        match (self.pci.input_offset(gpa), self.touch.as_mut()) {
+            (Some(offset), Some(screen)) => screen.read(offset, size),
+            _ => FLOATING_BUS,
+        }
+    }
+
+    /// Handles a device memory store.
+    pub fn memory_write(&mut self, gpa: u64, value: u32) {
+        if let (Some(offset), Some(screen)) = (self.pci.input_offset(gpa), self.touch.as_mut()) {
+            screen.write(offset, value);
+        }
+    }
+
+    /// Queues finger changes for the guest.
+    pub fn touch_input(&mut self, touch: Touch) {
+        if let Some(screen) = self.touch.as_mut() {
+            screen.touch(touch);
         }
     }
 
@@ -389,7 +426,7 @@ mod tests {
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
         (
-            Bus::new(Box::new(capture.clone()), || 0, Vec::new(), None),
+            Bus::new(Box::new(capture.clone()), || 0, Vec::new(), None, None),
             capture,
         )
     }

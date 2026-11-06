@@ -13,7 +13,7 @@
 
 Run `rax.exe` with no arguments to open the launcher. Everything stays in one folder: delete it and RAX is gone, with nothing left in the registry or AppData. Android keeps your apps in `data.img` in that folder, and dragging an `.apk` onto the window installs it. The app is about 0.7 MB, and the launcher uses about 17 MB of RAM.
 
-Android has internet through RAX's own small router, with no driver, no administrator rights, and no setup.
+F12 switches to game controls, where keys and the mouse become fingers on a virtual multi-touch screen. Android has internet through RAX's own small router, with no driver, no administrator rights, and no setup.
 
 **Google Play is not included.** It is licensed by Google, so RAX cannot ship it.
 

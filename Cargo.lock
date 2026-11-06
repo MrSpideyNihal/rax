@@ -73,6 +73,7 @@ name = "rax-vmm"
 version = "0.1.0"
 dependencies = [
  "rax-host",
+ "rax-input",
  "rax-net",
  "serde",
 ]

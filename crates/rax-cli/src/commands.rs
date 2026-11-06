@@ -9,6 +9,7 @@ use rax_host::assess::{self, Finding, Probes, Severity};
 use rax_host::host::{self, HostInfo};
 use rax_host::vulkan::{self, Device};
 use rax_host::whp::{self, Capabilities, ExitLatency, MapCost};
+use rax_input::{Phase, Point, Touch};
 use rax_vmm::framebuffer::Framebuffer;
 use rax_vmm::machine::{self, Config, Outcome, Report};
 use rax_vmm::ps2::GuestInput;
@@ -218,6 +219,33 @@ fn parse_input_script(text: &str) -> Result<Vec<(Duration, GuestInput)>, Box<dyn
     Ok(script)
 }
 
+/// Parses lines of `SECONDS SLOT down|move|up X Y`, positions from 0 to 1.
+fn parse_touch_script(text: &str) -> Result<Vec<(Duration, Touch)>, Box<dyn Error>> {
+    let mut script = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let [seconds, slot, phase, x, y] = line.split_whitespace().collect::<Vec<_>>()[..] else {
+            return Err(format!("bad touch script line: {line}").into());
+        };
+        let phase = match phase {
+            "down" => Phase::Down,
+            "move" => Phase::Move,
+            "up" => Phase::Up,
+            other => return Err(format!("bad touch phase: {other}").into()),
+        };
+        let at = Point {
+            x: x.parse()?,
+            y: y.parse()?,
+        };
+        let touch = Touch {
+            slot: slot.parse()?,
+            phase,
+            at,
+        };
+        script.push((Duration::from_secs_f64(seconds.parse()?), touch));
+    }
+    Ok(script)
+}
+
 fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
     let read =
         |path: &str| std::fs::read(path).map_err(|error| format!("could not read {path}: {error}"));
@@ -235,7 +263,12 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
             .map(|(width, height)| Framebuffer { width, height }),
         screenshot: options.screenshot.as_ref().map(PathBuf::from),
         network: options.network.then(rax_net::host::Network::start),
+        touchscreen: options.touch_script.is_some(),
         display: None,
+        touch_script: match &options.touch_script {
+            Some(path) => parse_touch_script(&std::fs::read_to_string(path)?)?,
+            None => Vec::new(),
+        },
         input_script: match &options.input_script {
             Some(path) => parse_input_script(&std::fs::read_to_string(path)?)?,
             None => Vec::new(),
