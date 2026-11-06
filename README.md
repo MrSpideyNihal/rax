@@ -5,7 +5,7 @@
 
 **A research project to build the lightest practical Android gaming runtime for Windows, in Rust.**
 
-> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. Rendering is software only, and there is no network or GPU acceleration, so no game runs yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
+> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. It has internet. Rendering is software only, with no GPU acceleration, so no game runs yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
 
 ![The RAX launcher](docs/images/launcher.png)
 
@@ -13,7 +13,9 @@
 
 Run `rax.exe` with no arguments to open the launcher. Everything stays in one folder: delete it and RAX is gone, with nothing left in the registry or AppData. Android keeps your apps in `data.img` in that folder, and dragging an `.apk` onto the window installs it. The app is about 0.7 MB, and the launcher uses about 17 MB of RAM.
 
-**Google Play is not included.** It is licensed by Google, so RAX cannot ship it, and RAX has no network yet in any case.
+Android has internet through RAX's own small router, with no driver, no administrator rights, and no setup.
+
+**Google Play is not included.** It is licensed by Google, so RAX cannot ship it.
 
 | Command | What it does |
 |---|---|

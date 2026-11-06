@@ -17,7 +17,7 @@ androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
 androidboot.selinux=permissive nomodeset HWACCEL=0 SRC= DATA= DEBUG= $extra"
 
 lines=$(wc -l < "$commands")
-timeout=$((wait_secs + (lines + 2) * step_secs + 10))
+timeout=$((wait_secs + (lines + 2) * step_secs + 10 + ${EXTRA_SECS:-0}))
 
 (
     sleep "$wait_secs"
@@ -30,6 +30,6 @@ timeout=$((wait_secs + (lines + 2) * step_secs + 10))
 ) | ./target/release/rax.exe vm run --shell --kernel guest/kernel \
     --initrd guest/initrd.img --disk guest/android-x86_64-9.0-r2.iso \
     --ram-mib "$ram_mib" --timeout-secs "$timeout" --cmdline "$cmdline" \
-    --framebuffer "${SCREEN:-1280x720}" --screenshot "$log.bmp" \
+    ${NET:+--net} --framebuffer "${SCREEN:-1280x720}" --screenshot "$log.bmp" \
     --report "$log.json" > "$log" 2>&1
 echo "exit $?"

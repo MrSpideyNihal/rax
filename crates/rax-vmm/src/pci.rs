@@ -26,6 +26,10 @@ const VENDOR_VIRTIO: u16 = 0x1af4;
 const DEVICE_VIRTIO_BLK: u16 = 0x1001;
 const SUBSYSTEM_VIRTIO_BLK: u16 = 2;
 const CLASS_MASS_STORAGE: u16 = 0x0100;
+/// Transitional virtio network device.
+const DEVICE_VIRTIO_NET: u16 = 0x1000;
+const SUBSYSTEM_VIRTIO_NET: u16 = 1;
+const CLASS_ETHERNET: u16 = 0x0200;
 /// Legacy virtio requires revision 0.
 const REVISION_LEGACY: u8 = 0;
 
@@ -55,16 +59,27 @@ fn host_bridge_header() -> [u8; HEADER_SIZE] {
     header
 }
 
-fn virtio_header(index: usize) -> [u8; HEADER_SIZE] {
+/// Which virtio device a slot holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Block,
+    Net,
+}
+
+fn virtio_header(index: usize, kind: Kind) -> [u8; HEADER_SIZE] {
+    let (device, subsystem, class) = match kind {
+        Kind::Block => (DEVICE_VIRTIO_BLK, SUBSYSTEM_VIRTIO_BLK, CLASS_MASS_STORAGE),
+        Kind::Net => (DEVICE_VIRTIO_NET, SUBSYSTEM_VIRTIO_NET, CLASS_ETHERNET),
+    };
     let mut header = [0; HEADER_SIZE];
     put_u16(&mut header, REG_VENDOR, VENDOR_VIRTIO);
-    put_u16(&mut header, REG_DEVICE, DEVICE_VIRTIO_BLK);
+    put_u16(&mut header, REG_DEVICE, device);
     header[REG_REVISION] = REVISION_LEGACY;
-    put_u16(&mut header, REG_CLASS, CLASS_MASS_STORAGE);
+    put_u16(&mut header, REG_CLASS, class);
     let bar = VIRTIO_BAR_DEFAULT + index as u32 * VIRTIO_BAR_SIZE;
     put_u32(&mut header, REG_BAR0, bar | BAR_IO_SPACE);
     put_u16(&mut header, REG_SUBSYSTEM_VENDOR, VENDOR_VIRTIO);
-    put_u16(&mut header, REG_SUBSYSTEM, SUBSYSTEM_VIRTIO_BLK);
+    put_u16(&mut header, REG_SUBSYSTEM, subsystem);
     header[REG_INTERRUPT_LINE] = VIRTIO_IRQ;
     header[REG_INTERRUPT_PIN] = INTERRUPT_PIN_A;
     header
@@ -80,13 +95,20 @@ pub struct Pci {
 }
 
 impl Pci {
-    /// Creates the bus with one virtio device per disk.
+    /// Creates the bus with one virtio device per disk, then the network
+    /// card if there is one.
     #[must_use]
-    pub fn new(disks: usize) -> Self {
+    pub fn new(disks: usize, network: bool) -> Self {
+        let kinds = (0..disks)
+            .map(|_| Kind::Block)
+            .chain(network.then_some(Kind::Net));
         Self {
             address: 0,
             host_bridge: host_bridge_header(),
-            virtio: (0..disks).map(virtio_header).collect(),
+            virtio: kinds
+                .enumerate()
+                .map(|(index, kind)| virtio_header(index, kind))
+                .collect(),
         }
     }
 
@@ -199,21 +221,21 @@ mod tests {
 
     #[test]
     fn address_port_reads_back_for_the_kernel_probe() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         pci.write_address(0x8000_0000);
         assert_eq!(pci.read_address(), 0x8000_0000);
     }
 
     #[test]
     fn the_host_bridge_identifies_itself() {
-        let mut pci = Pci::new(0);
+        let mut pci = Pci::new(0, false);
         assert_eq!(read(&mut pci, 0, 0, 2), u32::from(VENDOR_REDHAT));
         assert_eq!(read(&mut pci, 0, 0x0a, 2), u32::from(CLASS_HOST_BRIDGE));
     }
 
     #[test]
     fn virtio_identifies_as_a_legacy_block_device() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         assert_eq!(
             read(&mut pci, 1, 0, 4),
             u32::from(DEVICE_VIRTIO_BLK) << 16 | u32::from(VENDOR_VIRTIO)
@@ -226,15 +248,15 @@ mod tests {
 
     #[test]
     fn empty_slots_read_all_ones() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         assert_eq!(read(&mut pci, 2, 0, 4), u32::MAX);
-        let mut without_disk = Pci::new(0);
+        let mut without_disk = Pci::new(0, false);
         assert_eq!(read(&mut without_disk, 1, 0, 4), u32::MAX);
     }
 
     #[test]
     fn other_buses_and_functions_are_empty() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         pci.write_address(ENABLE_BIT | 1 << 16);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
         pci.write_address(ENABLE_BIT | 1 << 8);
@@ -243,21 +265,21 @@ mod tests {
 
     #[test]
     fn a_disabled_address_reads_nothing() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         pci.write_address(0);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
     }
 
     #[test]
     fn bar_sizing_reports_the_window_size() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         write(&mut pci, 1, 0x10, 4, u32::MAX);
         assert_eq!(read(&mut pci, 1, 0x10, 4), 0xffff_ffc1);
     }
 
     #[test]
     fn registers_decode_only_after_io_is_enabled() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         assert_eq!(pci.virtio_offset(0xc040), None);
         write(&mut pci, 1, 0x04, 2, 1);
         assert_eq!(pci.virtio_offset(0xc040), Some((0, 0)));
@@ -268,7 +290,7 @@ mod tests {
 
     #[test]
     fn a_moved_bar_moves_the_window() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         write(&mut pci, 1, 0x04, 2, 1);
         write(&mut pci, 1, 0x10, 4, 0xd000);
         assert_eq!(pci.virtio_offset(0xd010), Some((0, 0x10)));
@@ -277,7 +299,7 @@ mod tests {
 
     #[test]
     fn each_disk_gets_its_own_slot_and_window() {
-        let mut pci = Pci::new(2);
+        let mut pci = Pci::new(2, false);
         assert_eq!(read(&mut pci, 2, 0, 2), u32::from(VENDOR_VIRTIO));
         assert_eq!(read(&mut pci, 3, 0, 4), u32::MAX);
         write(&mut pci, 1, 0x04, 2, 1);
@@ -287,8 +309,16 @@ mod tests {
     }
 
     #[test]
+    fn the_network_card_follows_the_disks() {
+        let mut pci = Pci::new(1, true);
+        assert_eq!(read(&mut pci, 2, 0x02, 2), u32::from(DEVICE_VIRTIO_NET));
+        assert_eq!(read(&mut pci, 2, 0x0a, 2), u32::from(CLASS_ETHERNET));
+        assert_eq!(read(&mut pci, 2, 0x2e, 2), u32::from(SUBSYSTEM_VIRTIO_NET));
+    }
+
+    #[test]
     fn identity_registers_cannot_be_overwritten() {
-        let mut pci = Pci::new(1);
+        let mut pci = Pci::new(1, false);
         write(&mut pci, 1, 0, 4, 0);
         assert_eq!(read(&mut pci, 1, 0, 2), u32::from(VENDOR_VIRTIO));
     }

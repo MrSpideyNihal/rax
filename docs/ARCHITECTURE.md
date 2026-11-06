@@ -44,6 +44,7 @@ flowchart TB
 | `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT, RTC, PCI and virtio-blk devices, one vCPU. Forbids `unsafe` |
 | `crates/rax-input` | **exists, not connected** | Key-mapping profiles, keyboard and mouse to touch events. Forbids `unsafe` |
 | `crates/rax-ui` | **exists** | The launcher: procedural pixel art, a hand-written 5 by 7 font, no toolkit. Forbids `unsafe` |
+| `crates/rax-net` | **exists** | User-mode NAT: ARP, DHCP, DNS, UDP and a TCP proxy over Windows sockets. Forbids `unsafe` |
 | `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`, `rax input check`. Forbids `unsafe` |
 | Multiple vCPUs, more virtio devices | planned, Phase 1b | Required before Android is usable |
 | Input bridge | planned, Phase 3 | Raw Input to virtio-input |
@@ -91,6 +92,16 @@ An emulated 8042 with PS/2 keyboard and mouse reaches the guest through port I/O
 ### Storage
 
 Disk requests run on the vCPU thread during the notifying `out` exit, so a slow host disk stalls the guest. Everything the guest supplies is untrusted: descriptor indexes, chain lengths, addresses, and sizes are all checked, and a malformed ring stops the queue rather than panicking. Moving I/O off the vCPU thread is future work, to be justified by measurement.
+
+### Network
+
+A legacy virtio network card connects to a small router inside RAX. The guest sees 10.0.2.15 behind a router at 10.0.2.2. RAX answers ARP and DHCP itself, resolves names through Windows, and turns TCP and UDP into ordinary Windows sockets, so it needs no driver, no administrator rights, and no extra process. Traffic looks like that of any other application.
+
+TCP is proxied, not forwarded: the guest's connection ends inside RAX, and a host socket carries the data. The link to the guest cannot lose frames, because they wait for guest buffers, so there is no retransmission on that side.
+
+Known limits: IPv4 only, no ping beyond the router, and each TCP connection uses two threads. Data the guest uploads is queued without a limit if the far end is slow.
+
+Android-x86 normally wraps a wired card as a fake Wi-Fi network that someone must join. RAX passes `VIRT_WIFI=0`, so Android treats it as Ethernet and connects by itself.
 
 ### One folder
 

@@ -4,7 +4,8 @@
 .DESCRIPTION
     The result runs from any folder. It writes only beside itself, so deleting
     the folder removes RAX. Sharing this folder also shares Android-x86, so
-    its licences apply, including offering the source of its GPL parts.
+    its licences apply, including offering the source of its GPL parts. Check them
+    before sharing: the image includes a com.android.chrome package.
 .EXAMPLE
     ./scripts/make-portable.ps1 -Out dist/RAX
 #>

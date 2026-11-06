@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rax-host", "crates/rax-vmm", "crates/rax-input", "crates/rax-ui", "crates/rax-cli"]
+members = ["crates/rax-host", "crates/rax-vmm", "crates/rax-input", "crates/rax-ui", "crates/rax-net", "crates/rax-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,7 @@ rax-host = { path = "crates/rax-host" }
 rax-vmm = { path = "crates/rax-vmm" }
 rax-input = { path = "crates/rax-input" }
 rax-ui = { path = "crates/rax-ui" }
+rax-net = { path = "crates/rax-net" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -53,6 +53,7 @@ fn user_space_output_survives_repeated_boots() {
             own_init_cmdline: None,
             framebuffer: None,
             screenshot: None,
+            network: None,
             display: None,
             input_script: Vec::new(),
         })
@@ -103,6 +104,7 @@ fn guest_reads_and_writes_the_disk() {
         own_init_cmdline: None,
         framebuffer: None,
         screenshot: None,
+        network: None,
         display: None,
         input_script: Vec::new(),
     })
