@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
+use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
 use crate::serial::Sink;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
 
@@ -71,6 +72,10 @@ pub struct Config {
     /// Boots the guest's own init with this command line, leaving its
     /// initramfs untouched. Used for full operating systems such as Android.
     pub own_init_cmdline: Option<String>,
+    /// Gives the guest a screen of this size.
+    pub framebuffer: Option<Framebuffer>,
+    /// Saves the screen to this BMP file when the guest stops.
+    pub screenshot: Option<PathBuf>,
 }
 
 /// How the guest stopped.
@@ -399,11 +404,18 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         .clone()
         .unwrap_or_else(|| command_line(&api, disk.is_some()));
 
-    let vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
+    let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
+    if let Some(screen) = config.framebuffer {
+        vm.add_framebuffer(u64::from(FRAMEBUFFER_GPA), screen.size_bytes())?;
+    }
     vm.write_ram(kernel.load_address(), kernel.payload())?;
     vm.write_ram(initrd_gpa, &initrd)?;
     vm.write_ram(CMDLINE_GPA, &boot::cmdline_bytes(&cmdline)?)?;
-    let params = kernel.boot_params(ram_bytes, Some((initrd_gpa, initrd.len())))?;
+    let params = kernel.boot_params(
+        ram_bytes,
+        Some((initrd_gpa, initrd.len())),
+        config.framebuffer,
+    )?;
     vm.write_ram(BOOT_PARAMS_GPA, &params)?;
     let gdt = boot::gdt_bytes();
     vm.write_ram(GDT_GPA, &gdt)?;
@@ -444,6 +456,11 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     })?;
 
     let total_ms = started.elapsed().as_secs_f64() * 1e3;
+    if let (Some(screen), Some(path)) = (config.framebuffer, &config.screenshot) {
+        let mut pixels = vec![0_u8; screen.size_bytes()];
+        vm.read_framebuffer(&mut pixels)?;
+        std::fs::write(path, screen.to_bmp(&pixels))?;
+    }
     let boot_to_user_space_ms = ready
         .lock()
         .map_err(|_| "ready lock poisoned")?

@@ -6,7 +6,8 @@
 use std::marker::PhantomData;
 
 use crate::whp::{
-    Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, map_guest_ram, map_read_only, read_exit,
+    Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, map_guest_memory, map_guest_ram,
+    map_read_only, read_exit,
 };
 use crate::{Error, Result};
 
@@ -17,6 +18,7 @@ pub struct Vm<'a> {
     ram: GuestRegion,
     /// One page of `0xFF`, mapped wherever the guest probes absent hardware.
     floating_page: GuestRegion,
+    framebuffer: Option<GuestRegion>,
 }
 
 impl<'a> Vm<'a> {
@@ -32,12 +34,29 @@ impl<'a> Vm<'a> {
             partition,
             ram,
             floating_page,
+            framebuffer: None,
         })
     }
 
     /// Copies `bytes` into guest RAM at `gpa`.
     pub fn write_ram(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
         self.ram.write_at(gpa, bytes)
+    }
+
+    /// Maps zeroed memory at `gpa` for the guest to use as a screen.
+    pub fn add_framebuffer(&mut self, gpa: u64, size: usize) -> Result<()> {
+        let region = GuestRegion::new(size)?;
+        map_guest_memory(&self.partition, &region, gpa)?;
+        self.framebuffer = Some(region);
+        Ok(())
+    }
+
+    /// Copies the screen into `buffer`. Does nothing without a framebuffer.
+    pub fn read_framebuffer(&self, buffer: &mut [u8]) -> Result<()> {
+        match &self.framebuffer {
+            Some(region) => region.read_at(0, buffer),
+            None => Ok(()),
+        }
     }
 
     /// Fills `buffer` from guest RAM at `gpa`.

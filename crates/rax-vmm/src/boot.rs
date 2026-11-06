@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use crate::framebuffer::Framebuffer;
+
 /// Where `boot_params` (the "zero page") is placed.
 pub const BOOT_PARAMS_GPA: u64 = 0x7000;
 /// Where the boot GDT is placed.
@@ -192,8 +194,12 @@ impl<'a> BzImage<'a> {
         &self,
         ram_bytes: u64,
         initrd: Option<(u64, usize)>,
+        screen: Option<Framebuffer>,
     ) -> Result<[u8; 4096], BootError> {
         let mut page = [0_u8; 4096];
+        if let Some(screen) = screen {
+            screen.write_screen_info(&mut page);
+        }
         // The setup header's length is encoded in the jump at offset 0x200.
         let header_end = (OFF_JUMP + 2 + usize::from(self.image[OFF_JUMP + 1])).min(page.len());
         page[HEADER_START..header_end].copy_from_slice(&self.image[HEADER_START..header_end]);
@@ -318,7 +324,7 @@ mod tests {
         let data = image();
         let page = BzImage::parse(&data)
             .unwrap()
-            .boot_params(RAM, Some((0x1000_0000, 0x1234)))
+            .boot_params(RAM, Some((0x1000_0000, 0x1234)), None)
             .unwrap();
         assert_eq!(page[OFF_TYPE_OF_LOADER], LOADER_UNDEFINED);
         assert_eq!(page[OFF_LOADFLAGS] & CAN_USE_HEAP, CAN_USE_HEAP);
@@ -334,7 +340,7 @@ mod tests {
         let data = image();
         let page = BzImage::parse(&data)
             .unwrap()
-            .boot_params(RAM, None)
+            .boot_params(RAM, None, None)
             .unwrap();
         assert_eq!(page[OFF_E820_ENTRIES], 3);
         let entry = |index: usize| {

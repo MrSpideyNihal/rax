@@ -9,6 +9,7 @@ use rax_host::assess::{self, Finding, Probes, Severity};
 use rax_host::host::{self, HostInfo};
 use rax_host::vulkan::{self, Device};
 use rax_host::whp::{self, Capabilities, ExitLatency, MapCost};
+use rax_vmm::framebuffer::Framebuffer;
 use rax_vmm::machine::{self, Config, Outcome, Report};
 use serde::Serialize;
 
@@ -188,6 +189,10 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         disk: options.disk.as_ref().map(PathBuf::from),
         init_script: None,
         own_init_cmdline: options.cmdline.clone(),
+        framebuffer: options
+            .framebuffer
+            .map(|(width, height)| Framebuffer { width, height }),
+        screenshot: options.screenshot.as_ref().map(PathBuf::from),
     })?;
     eprintln!(
         "\nguest stopped: {:?}, user space after {} ms, {} exits, {} interrupts",

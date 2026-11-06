@@ -9,6 +9,7 @@
 pub mod boot;
 pub mod bus;
 pub mod cpio;
+pub mod framebuffer;
 pub mod pci;
 pub mod pic;
 pub mod pit;

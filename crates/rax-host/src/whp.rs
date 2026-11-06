@@ -551,6 +551,16 @@ pub(crate) fn map_guest_ram(partition: &Partition<'_>, ram: &GuestRegion) -> Res
     partition.map_unchecked(ram, 0, MAP_READ | MAP_WRITE | MAP_EXECUTE)
 }
 
+/// Maps `region` writable at `gpa`, with the same lifetime rule as
+/// [`map_guest_ram`].
+pub(crate) fn map_guest_memory(
+    partition: &Partition<'_>,
+    region: &GuestRegion,
+    gpa: u64,
+) -> Result<()> {
+    partition.map_unchecked(region, gpa, MAP_READ | MAP_WRITE)
+}
+
 /// Maps `region` read-only at `gpa`, with the same lifetime rule as
 /// [`map_guest_ram`].
 pub(crate) fn map_read_only(
