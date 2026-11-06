@@ -55,13 +55,14 @@ fn host_bridge_header() -> [u8; HEADER_SIZE] {
     header
 }
 
-fn virtio_header() -> [u8; HEADER_SIZE] {
+fn virtio_header(index: usize) -> [u8; HEADER_SIZE] {
     let mut header = [0; HEADER_SIZE];
     put_u16(&mut header, REG_VENDOR, VENDOR_VIRTIO);
     put_u16(&mut header, REG_DEVICE, DEVICE_VIRTIO_BLK);
     header[REG_REVISION] = REVISION_LEGACY;
     put_u16(&mut header, REG_CLASS, CLASS_MASS_STORAGE);
-    put_u32(&mut header, REG_BAR0, VIRTIO_BAR_DEFAULT | BAR_IO_SPACE);
+    let bar = VIRTIO_BAR_DEFAULT + index as u32 * VIRTIO_BAR_SIZE;
+    put_u32(&mut header, REG_BAR0, bar | BAR_IO_SPACE);
     put_u16(&mut header, REG_SUBSYSTEM_VENDOR, VENDOR_VIRTIO);
     put_u16(&mut header, REG_SUBSYSTEM, SUBSYSTEM_VIRTIO_BLK);
     header[REG_INTERRUPT_LINE] = VIRTIO_IRQ;
@@ -74,18 +75,18 @@ fn virtio_header() -> [u8; HEADER_SIZE] {
 pub struct Pci {
     address: u32,
     host_bridge: [u8; HEADER_SIZE],
-    /// `None` when the machine has no disk, so nothing is enumerated.
-    virtio: Option<[u8; HEADER_SIZE]>,
+    /// One header per disk, at devices 1 and up.
+    virtio: Vec<[u8; HEADER_SIZE]>,
 }
 
 impl Pci {
-    /// Creates the bus, with or without the virtio device.
+    /// Creates the bus with one virtio device per disk.
     #[must_use]
-    pub fn new(with_virtio: bool) -> Self {
+    pub fn new(disks: usize) -> Self {
         Self {
             address: 0,
             host_bridge: host_bridge_header(),
-            virtio: with_virtio.then(virtio_header),
+            virtio: (0..disks).map(virtio_header).collect(),
         }
     }
 
@@ -116,8 +117,7 @@ impl Pci {
     fn header(&self, device: u32) -> Option<&[u8; HEADER_SIZE]> {
         match device {
             0 => Some(&self.host_bridge),
-            1 => self.virtio.as_ref(),
-            _ => None,
+            device => self.virtio.get(device as usize - 1),
         }
     }
 
@@ -140,10 +140,10 @@ impl Pci {
     /// Handles a write to the data ports. Only the virtio device's command
     /// register, BAR0 and interrupt line are writable.
     pub fn write_data(&mut self, port_offset: u16, size: u8, value: u32) {
-        let Some((1, register)) = self.target(port_offset) else {
+        let Some((device @ 1.., register)) = self.target(port_offset) else {
             return;
         };
-        let Some(header) = self.virtio.as_mut() else {
+        let Some(header) = self.virtio.get_mut(device as usize - 1) else {
             return;
         };
         match (register, size) {
@@ -157,24 +157,25 @@ impl Pci {
         }
     }
 
-    /// Translates a port into an offset in the virtio register window. Ports
-    /// decode only after the guest enables I/O on the device.
+    /// Finds the disk and register a port belongs to. Ports decode only
+    /// after the guest enables I/O on that device.
     #[must_use]
-    pub fn virtio_offset(&self, port: u16) -> Option<u16> {
-        let header = self.virtio.as_ref()?;
-        let command = u16::from_le_bytes([header[REG_COMMAND], header[REG_COMMAND + 1]]);
-        if command & COMMAND_IO_ENABLE == 0 {
-            return None;
-        }
-        let bar = u32::from_le_bytes([
-            header[REG_BAR0],
-            header[REG_BAR0 + 1],
-            header[REG_BAR0 + 2],
-            header[REG_BAR0 + 3],
-        ]);
-        let base = bar & !(VIRTIO_BAR_SIZE - 1);
-        let offset = u32::from(port).checked_sub(base)?;
-        (offset < VIRTIO_BAR_SIZE).then_some(offset as u16)
+    pub fn virtio_offset(&self, port: u16) -> Option<(usize, u16)> {
+        self.virtio.iter().enumerate().find_map(|(index, header)| {
+            let command = u16::from_le_bytes([header[REG_COMMAND], header[REG_COMMAND + 1]]);
+            if command & COMMAND_IO_ENABLE == 0 {
+                return None;
+            }
+            let bar = u32::from_le_bytes([
+                header[REG_BAR0],
+                header[REG_BAR0 + 1],
+                header[REG_BAR0 + 2],
+                header[REG_BAR0 + 3],
+            ]);
+            let base = bar & !(VIRTIO_BAR_SIZE - 1);
+            let offset = u32::from(port).checked_sub(base)?;
+            (offset < VIRTIO_BAR_SIZE).then_some((index, offset as u16))
+        })
     }
 }
 
@@ -198,21 +199,21 @@ mod tests {
 
     #[test]
     fn address_port_reads_back_for_the_kernel_probe() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         pci.write_address(0x8000_0000);
         assert_eq!(pci.read_address(), 0x8000_0000);
     }
 
     #[test]
     fn the_host_bridge_identifies_itself() {
-        let mut pci = Pci::new(false);
+        let mut pci = Pci::new(0);
         assert_eq!(read(&mut pci, 0, 0, 2), u32::from(VENDOR_REDHAT));
         assert_eq!(read(&mut pci, 0, 0x0a, 2), u32::from(CLASS_HOST_BRIDGE));
     }
 
     #[test]
     fn virtio_identifies_as_a_legacy_block_device() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         assert_eq!(
             read(&mut pci, 1, 0, 4),
             u32::from(DEVICE_VIRTIO_BLK) << 16 | u32::from(VENDOR_VIRTIO)
@@ -225,15 +226,15 @@ mod tests {
 
     #[test]
     fn empty_slots_read_all_ones() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         assert_eq!(read(&mut pci, 2, 0, 4), u32::MAX);
-        let mut without_disk = Pci::new(false);
+        let mut without_disk = Pci::new(0);
         assert_eq!(read(&mut without_disk, 1, 0, 4), u32::MAX);
     }
 
     #[test]
     fn other_buses_and_functions_are_empty() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         pci.write_address(ENABLE_BIT | 1 << 16);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
         pci.write_address(ENABLE_BIT | 1 << 8);
@@ -242,41 +243,52 @@ mod tests {
 
     #[test]
     fn a_disabled_address_reads_nothing() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         pci.write_address(0);
         assert_eq!(pci.read_data(0, 4), u32::MAX);
     }
 
     #[test]
     fn bar_sizing_reports_the_window_size() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         write(&mut pci, 1, 0x10, 4, u32::MAX);
         assert_eq!(read(&mut pci, 1, 0x10, 4), 0xffff_ffc1);
     }
 
     #[test]
     fn registers_decode_only_after_io_is_enabled() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         assert_eq!(pci.virtio_offset(0xc040), None);
         write(&mut pci, 1, 0x04, 2, 1);
-        assert_eq!(pci.virtio_offset(0xc040), Some(0));
-        assert_eq!(pci.virtio_offset(0xc07f), Some(0x3f));
+        assert_eq!(pci.virtio_offset(0xc040), Some((0, 0)));
+        assert_eq!(pci.virtio_offset(0xc07f), Some((0, 0x3f)));
         assert_eq!(pci.virtio_offset(0xc080), None);
         assert_eq!(pci.virtio_offset(0xc03f), None);
     }
 
     #[test]
     fn a_moved_bar_moves_the_window() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         write(&mut pci, 1, 0x04, 2, 1);
         write(&mut pci, 1, 0x10, 4, 0xd000);
-        assert_eq!(pci.virtio_offset(0xd010), Some(0x10));
+        assert_eq!(pci.virtio_offset(0xd010), Some((0, 0x10)));
         assert_eq!(pci.virtio_offset(0xc040), None);
     }
 
     #[test]
+    fn each_disk_gets_its_own_slot_and_window() {
+        let mut pci = Pci::new(2);
+        assert_eq!(read(&mut pci, 2, 0, 2), u32::from(VENDOR_VIRTIO));
+        assert_eq!(read(&mut pci, 3, 0, 4), u32::MAX);
+        write(&mut pci, 1, 0x04, 2, 1);
+        write(&mut pci, 2, 0x04, 2, 1);
+        assert_eq!(pci.virtio_offset(0xc040), Some((0, 0)));
+        assert_eq!(pci.virtio_offset(0xc080), Some((1, 0)));
+    }
+
+    #[test]
     fn identity_registers_cannot_be_overwritten() {
-        let mut pci = Pci::new(true);
+        let mut pci = Pci::new(1);
         write(&mut pci, 1, 0, 4, 0);
         assert_eq!(read(&mut pci, 1, 0, 2), u32::from(VENDOR_VIRTIO));
     }

@@ -5,3 +5,8 @@
 .idea/
 .claude/
 /guest/
+/data.img
+/data.tmp
+/inbox.tmp
+/rax.cfg
+/dist/

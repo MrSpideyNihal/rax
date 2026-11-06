@@ -11,7 +11,9 @@
 
 ## What exists
 
-Run `rax.exe` with no arguments to open the launcher. Everything stays in one folder: delete it and RAX is gone, with nothing left in the registry or AppData. The app is about 0.7 MB, and the launcher uses about 16 MB of RAM.
+Run `rax.exe` with no arguments to open the launcher. Everything stays in one folder: delete it and RAX is gone, with nothing left in the registry or AppData. Android keeps your apps in `data.img` in that folder, and dragging an `.apk` onto the window installs it. The app is about 0.7 MB, and the launcher uses about 17 MB of RAM.
+
+**Google Play is not included.** It is licensed by Google, so RAX cannot ship it, and RAX has no network yet in any case.
 
 | Command | What it does |
 |---|---|
@@ -53,6 +55,8 @@ To run Android, fetch the verified image into `guest/`, then open the launcher:
 ./scripts/fetch-android.ps1
 cargo run --release -p rax-cli
 ```
+
+`./scripts/make-portable.ps1` builds the single folder.
 
 To boot Linux instead, download the verified test guest first. It is too large to keep in Git:
 

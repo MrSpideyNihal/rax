@@ -227,7 +227,7 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         ram_mib: options.ram_mib,
         timeout: Duration::from_secs(options.timeout_secs as u64),
         shell: options.shell,
-        disk: options.disk.as_ref().map(PathBuf::from),
+        disks: options.disks.iter().map(PathBuf::from).collect(),
         init_script: None,
         own_init_cmdline: options.cmdline.clone(),
         framebuffer: options

@@ -5,6 +5,8 @@
 mod args;
 
 #[cfg(windows)]
+mod apk;
+#[cfg(windows)]
 mod app;
 #[cfg(windows)]
 mod commands;

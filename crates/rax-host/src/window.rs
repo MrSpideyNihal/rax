@@ -4,7 +4,9 @@
 //! reports input. Must be created and used on one thread.
 
 use std::cell::RefCell;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 
 use crate::{Error, Result};
 
@@ -23,6 +25,7 @@ const WM_DESTROY: u32 = 0x0002;
 const WM_ACTIVATE: u32 = 0x0006;
 const WM_PAINT: u32 = 0x000f;
 const WM_CLOSE: u32 = 0x0010;
+const WM_DROPFILES: u32 = 0x0233;
 const WM_INPUT: u32 = 0x00ff;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
@@ -166,6 +169,13 @@ unsafe extern "system" {
     fn RegisterRawInputDevices(devices: *const RawInputDevice, count: u32, size: u32) -> i32;
 }
 
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn DragAcceptFiles(hwnd: Hwnd, accept: i32);
+    fn DragQueryFileW(drop: *mut c_void, index: u32, buffer: *mut u16, size: u32) -> u32;
+    fn DragFinish(drop: *mut c_void);
+}
+
 #[link(name = "gdi32")]
 unsafe extern "system" {
     fn SetStretchBltMode(hdc: Hdc, mode: i32) -> i32;
@@ -206,7 +216,7 @@ pub enum Button {
 }
 
 /// Something that happened in the window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// The user closed the window.
     Close,
@@ -248,6 +258,8 @@ pub enum Event {
     Focus(bool),
     /// Windows needs the contents drawn again, such as after a restore.
     Repaint,
+    /// A file was dragged onto the window.
+    Dropped(PathBuf),
 }
 
 thread_local! {
@@ -343,6 +355,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_ACTIVATE => Some(Event::Focus(w_param & 0xffff != 0)),
         WM_PAINT => Some(Event::Repaint),
+        WM_DROPFILES => {
+            // SAFETY: `w_param` is the HDROP Windows passed with WM_DROPFILES.
+            let path = unsafe { dropped_file(w_param as *mut c_void) };
+            path.map(Event::Dropped)
+        }
         WM_INPUT => read_raw_mouse(l_param),
         WM_MOUSEMOVE => Some(Event::Pointer {
             x: low_word(l_param),
@@ -359,6 +376,21 @@ unsafe extern "system" fn window_proc(
     }
     // SAFETY: the arguments are exactly those Windows passed in.
     unsafe { DefWindowProcW(hwnd, message, w_param, l_param) }
+}
+
+/// Reads the first dropped file and releases the drop handle.
+///
+/// # Safety
+///
+/// `drop` must be a live HDROP, which this call consumes.
+unsafe fn dropped_file(drop: *mut c_void) -> Option<PathBuf> {
+    let mut buffer = [0_u16; 1024];
+    // SAFETY: the caller guarantees `drop`, and the buffer size is passed.
+    let length = unsafe { DragQueryFileW(drop, 0, buffer.as_mut_ptr(), buffer.len() as u32) };
+    // SAFETY: the handle is live and is released only here.
+    unsafe { DragFinish(drop) };
+    let length = (length as usize).min(buffer.len());
+    (length > 0).then(|| PathBuf::from(OsString::from_wide(&buffer[..length])))
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -460,7 +492,10 @@ impl Window {
         // SAFETY: `hdc` is the live device context just obtained.
         unsafe { SetStretchBltMode(hdc, COLORONCOLOR) };
         // SAFETY: as above.
-        unsafe { ShowWindow(hwnd, SW_SHOW) };
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            DragAcceptFiles(hwnd, 1);
+        }
         let device = RawInputDevice {
             usage_page: USAGE_PAGE_GENERIC,
             usage: USAGE_MOUSE,
