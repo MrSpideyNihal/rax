@@ -22,6 +22,8 @@ const CAP_FEATURES: u32 = 0x0001;
 const CAP_PROCESSOR_VENDOR: u32 = 0x1000;
 const CAP_PROCESSOR_CLOCK: u32 = 0x1004;
 const PROP_PROCESSOR_COUNT: u32 = 0x1fff;
+const PROP_LOCAL_APIC_MODE: u32 = 0x1005;
+static LOCAL_APIC_MODE_XAPIC: u32 = 1;
 
 const MAP_READ: u32 = 0x1;
 const MAP_WRITE: u32 = 0x2;
@@ -83,6 +85,33 @@ struct ExitContext {
     union_data: [u8; 176],
 }
 
+/// `WHV_INTERRUPT_CONTROL`: type, destination mode and trigger mode in the
+/// low bits of the first field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct InterruptControl {
+    flags: u64,
+    destination: u32,
+    vector: u32,
+}
+
+const _: () = assert!(size_of::<InterruptControl>() == 16);
+const INTERRUPT_LOWEST_PRIORITY: u64 = 1;
+const INTERRUPT_LOGICAL: u64 = 1 << 8;
+
+impl InterruptControl {
+    /// A fixed, edge-triggered interrupt, or a lowest-priority one.
+    pub(crate) fn edge(vector: u8, destination: u8, logical: bool, lowest: bool) -> Self {
+        let kind = if lowest { INTERRUPT_LOWEST_PRIORITY } else { 0 };
+        let mode = if logical { INTERRUPT_LOGICAL } else { 0 };
+        Self {
+            flags: kind | mode,
+            destination: u32::from(destination),
+            vector: u32::from(vector),
+        }
+    }
+}
+
 const _: () = assert!(size_of::<ExitContext>() == 224);
 const _: () = assert!(size_of::<RegisterValue>() == 16);
 
@@ -110,6 +139,7 @@ pub struct Api {
     cancel_run: unsafe extern "system" fn(Handle, u32, u32) -> Hresult,
     set_registers:
         unsafe extern "system" fn(Handle, u32, *const u32, u32, *const RegisterValue) -> Hresult,
+    request_interrupt: unsafe extern "system" fn(Handle, *const InterruptControl, u32) -> Hresult,
     // Never moved out, so the pointers above stay valid for the lifetime of `Api`.
     _library: Library,
 }
@@ -136,6 +166,7 @@ impl Api {
                 get_registers: library.symbol(c"WHvGetVirtualProcessorRegisters")?,
                 set_registers: library.symbol(c"WHvSetVirtualProcessorRegisters")?,
                 cancel_run: library.symbol(c"WHvCancelRunVirtualProcessor")?,
+                request_interrupt: library.symbol(c"WHvRequestInterrupt")?,
                 _library: library,
             })
         }
@@ -203,6 +234,13 @@ pub(crate) struct Partition<'a> {
 
 impl<'a> Partition<'a> {
     pub(crate) fn new(api: &'a Api, processors: u32) -> Result<Self> {
+        Self::with_local_apic(api, processors, false)
+    }
+
+    /// Creates a partition. With `local_apic`, the hypervisor emulates each
+    /// CPU's local APIC, so interrupt acknowledgements and timers stay out
+    /// of RAX.
+    pub(crate) fn with_local_apic(api: &'a Api, processors: u32, local_apic: bool) -> Result<Self> {
         let mut handle: Handle = std::ptr::null_mut();
         // SAFETY: `handle` is a valid out pointer.
         check("WHvCreatePartition", unsafe {
@@ -219,6 +257,18 @@ impl<'a> Partition<'a> {
             )
         };
         check("WHvSetPartitionProperty", hr)?;
+        if local_apic {
+            // SAFETY: the property value is a u32 and its size is passed.
+            let hr = unsafe {
+                (api.set_partition_property)(
+                    handle,
+                    PROP_LOCAL_APIC_MODE,
+                    (&raw const LOCAL_APIC_MODE_XAPIC).cast(),
+                    4,
+                )
+            };
+            check("WHvSetPartitionProperty", hr)?;
+        }
         // SAFETY: `handle` is a live partition that has not been set up yet.
         check("WHvSetupPartition", unsafe {
             (api.setup_partition)(handle)
@@ -732,6 +782,15 @@ impl Partition<'_> {
         &self,
     ) -> (unsafe extern "system" fn(Handle, u32, u32) -> i32, Handle) {
         (self.api.cancel_run, self.handle)
+    }
+
+    pub(crate) fn interrupt_parts(
+        &self,
+    ) -> (
+        unsafe extern "system" fn(Handle, *const InterruptControl, u32) -> i32,
+        Handle,
+    ) {
+        (self.api.request_interrupt, self.handle)
     }
 }
 

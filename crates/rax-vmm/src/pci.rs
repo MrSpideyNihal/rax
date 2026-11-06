@@ -75,6 +75,10 @@ const INTERRUPT_PIN_A: u8 = 1;
 
 /// The IRQ wired to the virtio device.
 pub const VIRTIO_IRQ: u8 = 5;
+/// The GPU's own IRQ, used with the I/O APIC. Sharing line 5 meant Linux
+/// asked every disk "was it you?" on each GPU interrupt, and each question is
+/// a VM exit: 4 million of them in one Minecraft run.
+pub const GPU_IRQ: u8 = 11;
 
 fn put_u16(header: &mut [u8; HEADER_SIZE], at: usize, value: u16) {
     header[at..at + 2].copy_from_slice(&value.to_le_bytes());
@@ -207,6 +211,13 @@ impl Pci {
             input,
             gpu,
             balloon,
+        }
+    }
+
+    /// Moves the GPU to its own interrupt line.
+    pub fn use_gpu_irq(&mut self) {
+        if let Some(header) = self.gpu.and_then(|index| self.virtio.get_mut(index)) {
+            header[REG_INTERRUPT_LINE] = GPU_IRQ;
         }
     }
 
@@ -511,6 +522,19 @@ mod tests {
     fn the_balloon_needs_no_gpu() {
         let mut pci = Pci::new(0, false, false, false, true);
         assert_eq!(read(&mut pci, 1, 0x02, 2), u32::from(DEVICE_VIRTIO_BALLOON));
+    }
+
+    #[test]
+    fn the_gpu_can_leave_the_shared_line() {
+        let mut pci = Pci::new(1, false, false, true, false);
+        assert_eq!(read(&mut pci, 2, 0x3c, 1), u32::from(VIRTIO_IRQ));
+        pci.use_gpu_irq();
+        assert_eq!(read(&mut pci, 2, 0x3c, 1), u32::from(GPU_IRQ));
+        assert_eq!(
+            read(&mut pci, 1, 0x3c, 1),
+            u32::from(VIRTIO_IRQ),
+            "disks stay"
+        );
     }
 
     #[test]

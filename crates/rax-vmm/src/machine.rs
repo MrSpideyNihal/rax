@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rax_host::virgl::Renderer;
-use rax_host::vm::{self, Kicker, RamReleaser, Vm};
+use rax_host::vm::{self, Interrupter, Kicker, RamReleaser, Vm};
 use rax_host::whp::{Api, ExitInfo, VmExit};
 use rax_input::Touch;
 use rax_net::host::Network;
@@ -21,7 +21,9 @@ use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
 use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
+use crate::ioapic::Interrupt;
 use crate::mmio;
+use crate::mptable;
 use crate::ps2::GuestInput;
 use crate::serial::Sink;
 use crate::virtio_balloon::VirtioBalloon;
@@ -32,6 +34,18 @@ use crate::virtio_net::VirtioNet;
 
 /// Printed by the guest once user space is running.
 const READY_MARKER: &[u8] = b"RAX_GUEST_READY";
+/// Printed by Linux as it powers off. With the hypervisor's local APIC, its
+/// final `hlt` never reaches RAX, so this is how RAX learns the guest is done.
+const POWER_OFF_MARKER: &[u8] = b": Power down";
+/// The port Linux polls while timing its clock against the PIT.
+const SPEAKER_PORT: u16 = 0x61;
+/// Time between those polls. Linux rejects the whole measurement if it gets
+/// under 1000 reads in 10 ms, or if one read takes ten times the fastest. A VM
+/// exit can do that easily, and Android then ran with a clock that only moves
+/// every few milliseconds. Holding each read to this length passes both tests.
+const SPEAKER_POLL_NS: u64 = 8_000;
+/// Pacing only applies this long after boot, when Linux takes that measurement.
+const SPEAKER_PACING_ENDS_NS: u64 = 5_000_000_000;
 const INIT_PATH: &str = "rax-init";
 const BASE_CMDLINE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200 nolapic noapic \
     acpi=off nosmp reboot=k panic=-1 i8042.noaux tsc=reliable rdinit=/rax-init";
@@ -45,6 +59,8 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const HALT_POLL: Duration = Duration::from_millis(50);
 /// The longest the guest waits for RAM to finish being released.
 const RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// Virtual CPUs given to the guest.
+const CPUS: u8 = 1;
 /// Console text kept for a running app, in bytes.
 const CONSOLE_KEEP: usize = 16 * 1024;
 
@@ -104,6 +120,9 @@ pub struct Config {
     pub touchscreen: bool,
     /// Lets the guest give unused RAM back to the host.
     pub balloon: bool,
+    /// Uses the hypervisor's local APIC and an I/O APIC, for guests that
+    /// boot without `nolapic noapic`.
+    pub apic: bool,
     /// Connects a live window. `None` runs headless.
     pub display: Option<Display>,
     /// Timed input, for repeatable tests with no person at the keyboard.
@@ -199,6 +218,8 @@ struct Console {
     /// Shell prompts end without a newline, so they must not wait for one.
     flush_every_byte: bool,
     matched: usize,
+    matched_power_off: usize,
+    powered_off: Arc<AtomicBool>,
     ready: Arc<Mutex<Option<Instant>>>,
     /// Also keeps recent output here, for a running app to read.
     capture: Option<Arc<Mutex<String>>>,
@@ -220,7 +241,12 @@ impl Sink for Console {
         if self.flush_every_byte || byte == b'\n' {
             let _ = self.out.flush();
         }
-        self.matched = next_match(self.matched, byte);
+        self.matched_power_off = next_match(POWER_OFF_MARKER, self.matched_power_off, byte);
+        if self.matched_power_off == POWER_OFF_MARKER.len() {
+            self.matched_power_off = 0;
+            self.powered_off.store(true, Ordering::Relaxed);
+        }
+        self.matched = next_match(READY_MARKER, self.matched, byte);
         if self.matched == READY_MARKER.len() {
             self.matched = 0;
             if let Ok(mut ready) = self.ready.lock() {
@@ -230,13 +256,13 @@ impl Sink for Console {
     }
 }
 
-/// Advances a search for [`READY_MARKER`]. Its first byte does not repeat, so
-/// a mismatch only ever needs to restart.
-fn next_match(matched: usize, byte: u8) -> usize {
-    if READY_MARKER[matched] == byte {
+/// Advances a search for `marker`. A marker's first byte must not repeat in
+/// it, so a mismatch only ever needs to restart.
+fn next_match(marker: &[u8], matched: usize, byte: u8) -> usize {
+    if marker[matched] == byte {
         matched + 1
     } else {
-        usize::from(READY_MARKER[0] == byte)
+        usize::from(marker[0] == byte)
     }
 }
 
@@ -262,6 +288,10 @@ struct Shared {
     network_ready: Option<Arc<AtomicBool>>,
     /// Hands guest RAM to the thread that gives it back to Windows.
     releases: Sender<Release>,
+    /// Set when the guest's console says it has powered off.
+    powered_off: Arc<AtomicBool>,
+    /// When the configured run time ends.
+    deadline: Instant,
 }
 
 /// Work for the thread that gives RAM back. Windows takes up to milliseconds
@@ -307,7 +337,27 @@ impl Shared {
     }
 }
 
-fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<u8>>>) {
+fn send_interrupts(interrupter: &Interrupter<'_>, interrupts: Vec<Interrupt>) {
+    for interrupt in interrupts {
+        // A failure here is not recoverable and would show as a stalled
+        // guest, so it is printed rather than dropped.
+        if let Err(error) = interrupter.send(
+            interrupt.vector,
+            interrupt.destination,
+            interrupt.logical,
+            interrupt.lowest_priority,
+        ) {
+            eprintln!("could not deliver interrupt {interrupt:?}: {error}");
+        }
+    }
+}
+
+fn timer_loop(
+    shared: &Shared,
+    kicker: &Kicker<'_>,
+    interrupter: &Interrupter<'_>,
+    input: Option<&Receiver<Vec<u8>>>,
+) {
     let mut script_position = 0;
     let mut touch_position = 0;
     while !shared.stop.load(Ordering::Relaxed) {
@@ -362,7 +412,20 @@ fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<
         }
         let pending = bus.tick(now);
         let next = bus.next_timer_ns();
+        let interrupts = bus.take_interrupts();
         drop(bus);
+        send_interrupts(interrupter, interrupts);
+        // A sleeping guest no longer exits to RAX by itself, so this thread
+        // has to wake the vCPU for anything that should stop it.
+        let stopping = shared.powered_off.load(Ordering::Relaxed)
+            || Instant::now() >= shared.deadline
+            || shared
+                .display
+                .as_ref()
+                .is_some_and(|display| display.stop.load(Ordering::Relaxed));
+        if stopping {
+            kicker.kick();
+        }
         if pending || shared.network_pending() {
             shared.wake.notify_all();
             kicker.kick();
@@ -506,7 +569,7 @@ fn gpu_store(
                 .bus
                 .lock()
                 .map_err(|_| "device lock poisoned")?
-                .raise_virtio();
+                .raise_gpu();
         }
     }
     Ok(())
@@ -594,6 +657,7 @@ fn vcpu_loop(
     vm: &Vm<'_>,
     shared: &Shared,
     gpu: &mut Option<Gpu<'_>>,
+    interrupter: &Interrupter<'_>,
     deadline: Instant,
 ) -> Result<Finished, Box<dyn Error>> {
     let mut exits = 0_u64;
@@ -602,6 +666,7 @@ fn vcpu_loop(
     let mut window_exits = 0_u64;
     let mut last_frame = Instant::now();
     let mut interruptible = false;
+    let mut last_speaker_poll = 0;
     loop {
         let frame_due = last_frame.elapsed() >= FRAME_INTERVAL;
         if frame_due {
@@ -644,6 +709,15 @@ fn vcpu_loop(
                 _ => {}
             }
         }
+        if shared.powered_off.load(Ordering::Relaxed) {
+            return Ok(Finished {
+                outcome: Outcome::PoweredOff,
+                exits,
+                interrupts,
+                floating_pages,
+                window_exits,
+            });
+        }
         if Instant::now() >= deadline {
             return Ok(Finished {
                 outcome: Outcome::TimedOut,
@@ -675,6 +749,7 @@ fn vcpu_loop(
                     window_exits,
                 });
             }
+            send_interrupts(interrupter, bus.take_interrupts());
             match delivery(bus.pending_vector(), interruptible) {
                 Delivery::Inject(vector) => {
                     vm.inject_interrupt(vector)?;
@@ -691,6 +766,12 @@ fn vcpu_loop(
         interruptible = info.interruptible;
         match info.exit {
             VmExit::PortRead { port, size } => {
+                if port == SPEAKER_PORT && shared.now_ns() < SPEAKER_PACING_ENDS_NS {
+                    while shared.now_ns() < last_speaker_poll + SPEAKER_POLL_NS {
+                        std::hint::spin_loop();
+                    }
+                    last_speaker_poll = shared.now_ns();
+                }
                 let now = shared.now_ns();
                 let value = shared
                     .bus
@@ -817,7 +898,10 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         None => command_line(&api, !disks.is_empty() || config.network.is_some()),
     };
 
-    let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
+    let mut vm = Vm::with_local_apic(&api, config.ram_mib * 1024 * 1024, config.apic)?;
+    if config.apic {
+        vm.write_ram(mptable::MP_GPA, &mptable::build(CPUS))?;
+    }
     // With a GPU, the guest finds its screen there and not in the boot data.
     let vesa_screen = config.framebuffer.filter(|_| config.gpu.is_none());
     if let Some(screen) = vesa_screen {
@@ -838,10 +922,13 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     )?;
 
     let ready = Arc::new(Mutex::new(None));
+    let powered_off = Arc::new(AtomicBool::new(false));
     let console = Console {
         out: std::io::stdout(),
         flush_every_byte: config.shell,
         matched: 0,
+        matched_power_off: 0,
+        powered_off: Arc::clone(&powered_off),
         ready: Arc::clone(&ready),
         capture: config
             .display
@@ -885,8 +972,18 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         touch_ready: AtomicBool::new(false),
         network_ready,
         releases,
+        powered_off,
+        deadline,
     };
+    if config.apic {
+        shared
+            .bus
+            .lock()
+            .map_err(|_| "device lock poisoned")?
+            .add_ioapic(CPUS);
+    }
     let kicker = vm.kicker();
+    let interrupter = vm.interrupter();
     let releaser = vm.ram_releaser();
     let input = config.shell.then(spawn_stdin_reader);
     let mut gpu = match (&config.gpu, config.framebuffer) {
@@ -900,11 +997,18 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     };
 
     let finished = std::thread::scope(|scope| {
-        let (timer_shared, timer_kicker) = (&shared, &kicker);
-        scope.spawn(move || timer_loop(timer_shared, timer_kicker, input.as_ref()));
+        let (timer_shared, timer_kicker, timer_interrupter) = (&shared, &kicker, &interrupter);
+        scope.spawn(move || {
+            timer_loop(
+                timer_shared,
+                timer_kicker,
+                timer_interrupter,
+                input.as_ref(),
+            );
+        });
         let (release_shared, release_handle) = (&shared, &releaser);
         scope.spawn(move || release_loop(release_shared, release_handle, &release_work));
-        let result = vcpu_loop(&vm, &shared, &mut gpu, deadline);
+        let result = vcpu_loop(&vm, &shared, &mut gpu, &interrupter, deadline);
         shared.stop.store(true, Ordering::Relaxed);
         result
     })
@@ -959,11 +1063,15 @@ mod tests {
     use super::*;
 
     fn scan(text: &[u8]) -> usize {
+        scan_for(READY_MARKER, text)
+    }
+
+    fn scan_for(marker: &[u8], text: &[u8]) -> usize {
         let mut matched = 0;
         let mut found = 0;
         for &byte in text {
-            matched = next_match(matched, byte);
-            if matched == READY_MARKER.len() {
+            matched = next_match(marker, matched, byte);
+            if matched == marker.len() {
                 matched = 0;
                 found += 1;
             }
@@ -984,6 +1092,31 @@ mod tests {
     #[test]
     fn ignores_text_without_the_marker() {
         assert_eq!(scan(b"RAX_GUEST_NOT_READY"), 0);
+    }
+
+    #[test]
+    fn power_off_is_found_in_the_console() {
+        assert_eq!(
+            scan_for(POWER_OFF_MARKER, b"[ 9.1] reboot: Power down\n"),
+            1
+        );
+        assert_eq!(
+            scan_for(POWER_OFF_MARKER, b"reboot: Restarting system\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_power_off_marker_can_restart_on_a_mismatch() {
+        assert!(!POWER_OFF_MARKER[1..].contains(&POWER_OFF_MARKER[0]));
+    }
+
+    #[test]
+    fn speaker_pacing_passes_the_kernels_two_tests() {
+        // At least 1000 reads in 10 ms, and a 50 us host hiccup stays under
+        // ten times the fastest read.
+        const { assert!(10_000_000 / SPEAKER_POLL_NS >= 1000) };
+        const { assert!(50_000 < 10 * SPEAKER_POLL_NS) };
     }
 
     #[test]

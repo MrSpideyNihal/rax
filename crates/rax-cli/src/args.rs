@@ -72,6 +72,8 @@ pub struct VmRun {
     pub gpu: Option<String>,
     /// Lets the guest give unused RAM back.
     pub balloon: bool,
+    /// Uses the hypervisor's local APIC.
+    pub apic: bool,
     /// File to save the screen to.
     pub screenshot: Option<String>,
     /// File of timed input for repeatable tests.
@@ -141,6 +143,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut framebuffer = None;
     let mut gpu = None;
     let mut balloon = false;
+    let mut apic = false;
     let mut screenshot = None;
     let mut input_script = None;
     let mut network = false;
@@ -149,6 +152,10 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     while let Some(option) = rest.next() {
         if *option == "--shell" {
             shell = true;
+            continue;
+        }
+        if *option == "--apic" {
+            apic = true;
             continue;
         }
         if *option == "--balloon" {
@@ -190,6 +197,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         framebuffer,
         gpu,
         balloon,
+        apic,
         screenshot,
         input_script,
         network,
@@ -301,6 +309,7 @@ mod tests {
                 framebuffer: None,
                 gpu: None,
                 balloon: false,
+                apic: false,
                 screenshot: None,
                 input_script: None,
                 network: false,

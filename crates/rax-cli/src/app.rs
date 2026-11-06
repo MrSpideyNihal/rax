@@ -61,18 +61,27 @@ fn android_key(scancode: u8, extended: bool) -> (u8, bool) {
     }
 }
 
-const ANDROID_CMDLINE: &str = "console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
+const ANDROID_CMDLINE: &str = "console=ttyS0 acpi=off reboot=k panic=-1 \
     tsc=reliable androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
     androidboot.selinux=permissive VIRT_WIFI=0 SRC= DEBUG=";
 /// Keeps Android on the plain framebuffer.
 const SOFTWARE_GRAPHICS: &str = "nomodeset HWACCEL=0";
+/// The 8259 interrupt controller, for the short run that formats the disk.
+const LEGACY_INTERRUPTS: &str = "nolapic noapic nosmp";
+/// The hypervisor's local APIC and RAX's I/O APIC, which cost far fewer exits.
+const APIC_INTERRUPTS: &str = "no_timer_check nr_cpus=1";
 /// The folder `scripts/fetch-gpu.ps1` fills.
 const GPU_FOLDER: &str = "gpu";
 const GPU_LIBRARY: &str = "libvirglrenderer-1.dll";
 
-fn android_cmdline(data_arg: &str, gpu: bool) -> String {
+fn android_cmdline(data_arg: &str, gpu: bool, apic: bool) -> String {
     let graphics = if gpu { "" } else { SOFTWARE_GRAPHICS };
-    format!("{ANDROID_CMDLINE} {graphics} DATA={data_arg}")
+    let interrupts = if apic {
+        APIC_INTERRUPTS
+    } else {
+        LEGACY_INTERRUPTS
+    };
+    format!("{ANDROID_CMDLINE} {interrupts} {graphics} DATA={data_arg}")
 }
 
 /// The renderer's folder, if this copy of RAX has one.
@@ -185,10 +194,11 @@ fn android_config(
         shell: false,
         disks,
         init_script: None,
-        own_init_cmdline: Some(android_cmdline(data_arg, false)),
+        own_init_cmdline: Some(android_cmdline(data_arg, false, false)),
         framebuffer: None,
         gpu: None,
         balloon: false,
+        apic: false,
         screenshot: None,
         network: None,
         touchscreen: false,
@@ -403,7 +413,8 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     config.ram_mib = MEMORY_CHOICES_MIB[settings.memory];
     config.framebuffer = Some(screen);
     config.gpu = gpu_folder(root);
-    config.own_init_cmdline = Some(android_cmdline("vdb", config.gpu.is_some()));
+    config.apic = true;
+    config.own_init_cmdline = Some(android_cmdline("vdb", config.gpu.is_some(), true));
     config.network = Some(Network::start());
     config.touchscreen = true;
     config.display = Some(display.clone());
@@ -718,9 +729,17 @@ mod tests {
 
     #[test]
     fn only_the_gpu_needs_kernel_mode_setting() {
-        assert!(android_cmdline("vdb", false).contains("nomodeset HWACCEL=0"));
-        let gpu = android_cmdline("vdb", true);
+        assert!(android_cmdline("vdb", false, true).contains("nomodeset HWACCEL=0"));
+        let gpu = android_cmdline("vdb", true, true);
         assert!(!gpu.contains("nomodeset") && !gpu.contains("HWACCEL"));
+    }
+
+    #[test]
+    fn the_apic_path_must_not_be_disabled_on_the_command_line() {
+        // Regression test: `nosmp` silently turned the I/O APIC off.
+        let line = android_cmdline("vdb", true, true);
+        assert!(!line.contains("nosmp") && !line.contains("noapic") && !line.contains("nolapic"));
+        assert!(android_cmdline("vdb", false, false).contains(LEGACY_INTERRUPTS));
     }
 
     #[test]

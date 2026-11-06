@@ -8,8 +8,8 @@ use std::path::Path;
 
 use crate::virgl::Renderer;
 use crate::whp::{
-    Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, discard_pages, map_guest_memory,
-    map_guest_ram, map_read_only, read_exit,
+    Api, ExitInfo, GuestRegion, Handle, InterruptControl, PAGE, Partition, discard_pages,
+    map_guest_memory, map_guest_ram, map_read_only, read_exit,
 };
 use crate::{Error, Result};
 
@@ -26,8 +26,14 @@ pub struct Vm<'a> {
 impl<'a> Vm<'a> {
     /// Creates the machine and maps `ram_bytes` of zeroed RAM.
     pub fn new(api: &'a Api, ram_bytes: usize) -> Result<Self> {
+        Self::with_local_apic(api, ram_bytes, false)
+    }
+
+    /// Creates the machine, optionally with the hypervisor emulating the
+    /// local APIC.
+    pub fn with_local_apic(api: &'a Api, ram_bytes: usize, local_apic: bool) -> Result<Self> {
         let ram = GuestRegion::new(ram_bytes)?;
-        let partition = Partition::new(api, 1)?;
+        let partition = Partition::with_local_apic(api, 1, local_apic)?;
         map_guest_ram(&partition, &ram)?;
         partition.create_processor(0)?;
         let floating_page = GuestRegion::new(PAGE)?;
@@ -157,6 +163,17 @@ impl<'a> Vm<'a> {
         self.partition.request_interrupt_window()
     }
 
+    /// A handle other threads use to send interrupts to the local APICs.
+    #[must_use]
+    pub fn interrupter(&self) -> Interrupter<'_> {
+        let (request, handle) = self.partition.interrupt_parts();
+        Interrupter {
+            request,
+            handle,
+            _vm: PhantomData,
+        }
+    }
+
     /// A handle other threads use to stop the vCPU.
     #[must_use]
     pub fn kicker(&self) -> Kicker<'_> {
@@ -189,6 +206,45 @@ impl RamReleaser<'_> {
         // SAFETY: `ram` and `size` describe the Vm's RAM, which the lifetime
         // keeps alive for as long as this handle exists.
         unsafe { discard_pages(self.ram, self.size, gpa, length) }
+    }
+}
+
+/// Sends interrupts to the local APICs from any thread. Borrowing the `Vm`
+/// keeps the partition alive.
+pub struct Interrupter<'a> {
+    request: unsafe extern "system" fn(Handle, *const InterruptControl, u32) -> i32,
+    handle: Handle,
+    _vm: PhantomData<&'a ()>,
+}
+
+// SAFETY: `handle` is only passed to WHvRequestInterrupt, which exists to be
+// called from device threads. The lifetime keeps the partition alive.
+unsafe impl Send for Interrupter<'_> {}
+// SAFETY: as above. The call needs no synchronisation on the caller's side.
+unsafe impl Sync for Interrupter<'_> {}
+
+impl Interrupter<'_> {
+    /// Sends an edge-triggered interrupt. Failure means the guest loses this
+    /// interrupt, which only the hypervisor can explain, so it is reported.
+    pub fn send(&self, vector: u8, destination: u8, logical: bool, lowest: bool) -> Result<()> {
+        let control = InterruptControl::edge(vector, destination, logical, lowest);
+        // SAFETY: the partition outlives `self`, and `control` is a valid
+        // WHV_INTERRUPT_CONTROL of the size passed.
+        let code = unsafe {
+            (self.request)(
+                self.handle,
+                &raw const control,
+                size_of::<InterruptControl>() as u32,
+            )
+        };
+        if code < 0 {
+            Err(Error::Hresult {
+                api: "WHvRequestInterrupt",
+                code,
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 

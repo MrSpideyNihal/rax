@@ -22,7 +22,7 @@ USAGE:
     rax bench whp [--iterations N] [--map-mib N] [--out FILE]
     rax vm run --kernel FILE --initrd FILE [--ram-mib N] [--timeout-secs N]
                [--shell] [--disk FILE] [--cmdline TEXT] [--report FILE]
-               [--framebuffer WxH] [--gpu FOLDER] [--balloon] [--screenshot FILE] [--net]
+               [--framebuffer WxH] [--gpu FOLDER] [--balloon] [--apic] [--screenshot FILE] [--net]
     rax input check FILE
     rax ui preview FILE
     rax --version
