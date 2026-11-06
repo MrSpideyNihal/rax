@@ -57,8 +57,8 @@ pub struct VmRun {
     pub shell: bool,
     /// File to write the JSON report to.
     pub report: Option<String>,
-    /// Raw disk image for the guest.
-    pub disk: Option<String>,
+    /// Raw disk images for the guest. The option may repeat.
+    pub disks: Vec<String>,
     /// Boot the guest's own init with this command line.
     pub cmdline: Option<String>,
     /// Screen size, as `(width, height)`.
@@ -120,7 +120,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut timeout_secs = DEFAULT_VM_TIMEOUT_SECS;
     let mut shell = false;
     let mut report = None;
-    let mut disk = None;
+    let mut disks = Vec::new();
     let mut cmdline = None;
     let mut framebuffer = None;
     let mut screenshot = None;
@@ -140,7 +140,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--ram-mib" => ram_mib = positive(option, value)?,
             "--timeout-secs" => timeout_secs = positive(option, value)?,
             "--report" => report = Some((*value).to_owned()),
-            "--disk" => disk = Some((*value).to_owned()),
+            "--disk" => disks.push((*value).to_owned()),
             "--cmdline" => cmdline = Some((*value).to_owned()),
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
             "--screenshot" => screenshot = Some((*value).to_owned()),
@@ -155,7 +155,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         timeout_secs,
         shell,
         report,
-        disk,
+        disks,
         cmdline,
         framebuffer,
         screenshot,
@@ -262,7 +262,7 @@ mod tests {
                 timeout_secs: DEFAULT_VM_TIMEOUT_SECS,
                 shell: true,
                 report: None,
-                disk: None,
+                disks: Vec::new(),
                 cmdline: None,
                 framebuffer: None,
                 screenshot: None,

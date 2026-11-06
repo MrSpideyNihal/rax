@@ -141,6 +141,7 @@ pub struct Launcher {
     settings: Settings,
     ready: bool,
     hover: Option<Control>,
+    status: Option<String>,
     dirty: bool,
 }
 
@@ -175,6 +176,7 @@ impl Launcher {
             settings,
             ready,
             hover: None,
+            status: None,
             dirty: true,
         }
     }
@@ -227,6 +229,12 @@ impl Launcher {
         Some(Action::Save(self.settings))
     }
 
+    /// Shows a short message beside the Start button.
+    pub fn set_status(&mut self, status: Option<String>) {
+        self.status = status;
+        self.dirty = true;
+    }
+
     /// Forces the next draw, such as after returning from Android.
     pub fn invalidate(&mut self) {
         self.dirty = true;
@@ -241,6 +249,10 @@ impl Launcher {
         self.draw_title();
         self.draw_start();
         self.draw_card();
+        if let Some(status) = &self.status {
+            self.frame
+                .text(START.x + 2, START.y + START.height + 16, status, 2, INK);
+        }
         Some(self.frame.pixels())
     }
 

@@ -32,6 +32,8 @@ const NO_PCI: &str = " pci=off";
 const TIMER_IDLE: Duration = Duration::from_millis(1);
 /// How often the screen is copied for a live window.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Console text kept for a running app, in bytes.
+const CONSOLE_KEEP: usize = 16 * 1024;
 
 const SMOKE_INIT: &str = "#!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc
@@ -68,8 +70,9 @@ pub struct Config {
     pub timeout: Duration,
     /// Give the host's stdin to a guest shell, instead of a smoke test.
     pub shell: bool,
-    /// A raw disk image, shown to the guest as `/dev/vda`. Writes are kept.
-    pub disk: Option<PathBuf>,
+    /// Raw disk images, shown as `/dev/vda`, `/dev/vdb` and so on. Writes
+    /// are kept.
+    pub disks: Vec<PathBuf>,
     /// Replaces the built-in init script.
     pub init_script: Option<String>,
     /// Boots the guest's own init with this command line, leaving its
@@ -94,6 +97,10 @@ pub struct Display {
     pub input: Arc<Mutex<Vec<GuestInput>>>,
     /// Set to shut the guest down.
     pub stop: Arc<AtomicBool>,
+    /// Text to type into the guest's console.
+    pub console_input: Arc<Mutex<Vec<u8>>>,
+    /// What the console has printed, newest last.
+    pub console_output: Arc<Mutex<String>>,
 }
 
 impl Display {
@@ -104,6 +111,8 @@ impl Display {
             frame: Arc::new(Mutex::new(vec![0; size_bytes])),
             input: Arc::new(Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
+            console_input: Arc::new(Mutex::new(Vec::new())),
+            console_output: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -162,10 +171,21 @@ struct Console {
     flush_every_byte: bool,
     matched: usize,
     ready: Arc<Mutex<Option<Instant>>>,
+    /// Also keeps recent output here, for a running app to read.
+    capture: Option<Arc<Mutex<String>>>,
 }
 
 impl Sink for Console {
     fn put(&mut self, byte: u8) {
+        if let Some(capture) = &self.capture
+            && let Ok(mut text) = capture.lock()
+        {
+            text.push(char::from(byte));
+            if text.len() > CONSOLE_KEEP * 2 {
+                let cut = text.len() - CONSOLE_KEEP;
+                text.drain(..cut);
+            }
+        }
         // A closed stdout must not stop the guest.
         let _ = self.out.write_all(&[byte]);
         if self.flush_every_byte || byte == b'\n' {
@@ -226,6 +246,13 @@ fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<
         };
         for event in window_input {
             bus.guest_input(event);
+        }
+        if let Some(display) = &shared.display
+            && let Ok(mut typed) = display.console_input.lock()
+            && !typed.is_empty()
+        {
+            bus.console_input(&typed);
+            typed.clear();
         }
         while let Some((at, event)) = shared.input_script.get(script_position) {
             if u128::from(now) < at.as_nanos() {
@@ -476,10 +503,14 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     }
     let initrd_gpa = kernel.initrd_address(initrd.len(), ram_bytes)?;
 
-    let disk = config.disk.as_ref().map(open_disk).transpose()?;
+    let disks = config
+        .disks
+        .iter()
+        .map(open_disk)
+        .collect::<Result<Vec<_>, _>>()?;
     let cmdline = match &config.own_init_cmdline {
         Some(own) => with_tsc_rate(&api, own.clone()),
-        None => command_line(&api, disk.is_some()),
+        None => command_line(&api, !disks.is_empty()),
     };
 
     let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
@@ -510,11 +541,15 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         flush_every_byte: config.shell,
         matched: 0,
         ready: Arc::clone(&ready),
+        capture: config
+            .display
+            .as_ref()
+            .map(|display| Arc::clone(&display.console_output)),
     };
     let started = Instant::now();
     let deadline = started + config.timeout;
     let shared = Shared {
-        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds, disk)),
+        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds, disks)),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,

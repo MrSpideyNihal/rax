@@ -92,6 +92,14 @@ An emulated 8042 with PS/2 keyboard and mouse reaches the guest through port I/O
 
 Disk requests run on the vCPU thread during the notifying `out` exit, so a slow host disk stalls the guest. Everything the guest supplies is untrusted: descriptor indexes, chain lengths, addresses, and sizes are all checked, and a malformed ring stops the queue rather than panicking. Moving I/O off the vCPU thread is future work, to be justified by measurement.
 
+### One folder
+
+`rax.exe` writes only beside itself: `rax.cfg`, `data.img` for Android's `/data`, and a temporary `inbox.tmp` during a session. Nothing goes in the registry or AppData, so deleting the folder removes RAX.
+
+On first run the app creates an 8 GB `data.img` and boots Android to its console, where Android's own `mke2fs` formats it. The file only gets its final name after that succeeds, so an interrupted first run simply starts again.
+
+An APK dropped on the window is written to the inbox disk, and a command typed into Android's console copies and installs it. This needs no network or adb.
+
 ### Boot
 
 RAX boots Linux directly, with no BIOS. It loads the `bzImage` payload, writes `boot_params` with an E820 memory map, adds an init script to the initramfs as a concatenated cpio archive, and enters the kernel's 32-bit entry point. The kernel switches itself to long mode.

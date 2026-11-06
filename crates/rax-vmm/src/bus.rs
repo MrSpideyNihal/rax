@@ -72,7 +72,7 @@ pub struct Bus {
     serial: Serial,
     ps2: Ps2,
     pci: Pci,
-    disk: Option<VirtioBlk>,
+    disks: Vec<VirtioBlk>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -81,7 +81,7 @@ pub struct Bus {
 impl Bus {
     /// Creates the machine's devices.
     #[must_use]
-    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64, disk: Option<VirtioBlk>) -> Self {
+    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64, disks: Vec<VirtioBlk>) -> Self {
         Self {
             pic: Pic::default(),
             slave_pic: Pic::default(),
@@ -90,8 +90,8 @@ impl Bus {
             wall_clock,
             serial: Serial::new(console),
             ps2: Ps2::default(),
-            pci: Pci::new(disk.is_some()),
-            disk,
+            pci: Pci::new(disks.len()),
+            disks,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
@@ -152,12 +152,12 @@ impl Bus {
                 self.stats.pci += 1;
                 self.pci.read_data(port - PCI_DATA_START, size)
             }
-            _ => match (self.pci.virtio_offset(port), self.disk.as_mut()) {
-                (Some(offset), Some(disk)) => {
+            _ => match self.pci.virtio_offset(port) {
+                Some((index, offset)) => {
                     self.stats.disk += 1;
-                    disk.read(offset, size)
+                    self.disks[index].read(offset, size)
                 }
-                _ => {
+                None => {
                     self.count_unclaimed(port);
                     FLOATING_BUS
                 }
@@ -229,12 +229,12 @@ impl Bus {
                 self.stats.pci += 1;
                 self.pci.write_data(port - PCI_DATA_START, size, value);
             }
-            _ => match (self.pci.virtio_offset(port), self.disk.as_mut()) {
-                (Some(offset), Some(disk)) => {
+            _ => match self.pci.virtio_offset(port) {
+                Some((index, offset)) => {
                     self.stats.disk += 1;
-                    disk.write(offset, value);
+                    self.disks[index].write(offset, value);
                 }
-                _ => self.count_unclaimed(port),
+                None => self.count_unclaimed(port),
             },
         }
     }
@@ -256,12 +256,14 @@ impl Bus {
     /// Runs any disk requests the guest has queued. Call after a port write,
     /// while the vCPU is stopped.
     pub fn service_disk(&mut self, memory: &dyn GuestMemory) {
-        if let Some(disk) = self.disk.as_mut() {
+        let mut raise = false;
+        for disk in &mut self.disks {
             disk.service(memory);
-            self.stats.disk_requests = disk.requests();
-            if disk.take_irq() {
-                self.pic.raise(VIRTIO_IRQ);
-            }
+            raise |= disk.take_irq();
+        }
+        self.stats.disk_requests = self.disks.iter().map(VirtioBlk::requests).sum();
+        if raise {
+            self.pic.raise(VIRTIO_IRQ);
         }
     }
 
@@ -356,7 +358,10 @@ mod tests {
 
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
-        (Bus::new(Box::new(capture.clone()), || 0, None), capture)
+        (
+            Bus::new(Box::new(capture.clone()), || 0, Vec::new()),
+            capture,
+        )
     }
 
     fn init_pic(bus: &mut Bus) {
