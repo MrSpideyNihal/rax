@@ -24,6 +24,11 @@ pub enum Command {
     },
     /// Boot a Linux guest.
     VmRun(VmRun),
+    /// Check a key-mapping profile.
+    InputCheck {
+        /// Path to the profile.
+        profile: String,
+    },
     /// Print usage.
     Help,
     /// Print the version.
@@ -45,6 +50,14 @@ pub struct VmRun {
     pub shell: bool,
     /// File to write the JSON report to.
     pub report: Option<String>,
+    /// Raw disk image for the guest.
+    pub disk: Option<String>,
+    /// Boot the guest's own init with this command line.
+    pub cmdline: Option<String>,
+    /// Screen size, as `(width, height)`.
+    pub framebuffer: Option<(u16, u16)>,
+    /// File to save the screen to.
+    pub screenshot: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
@@ -57,6 +70,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         ["doctor", "--json"] => Ok(Command::Doctor { json: true }),
         ["bench", "whp", options @ ..] => parse_bench(options),
         ["vm", "run", options @ ..] => parse_vm_run(options),
+        ["input", "check", profile] => Ok(Command::InputCheck {
+            profile: (*profile).to_owned(),
+        }),
         [other, ..] => Err(format!("unknown command or option: {other}")),
     }
 }
@@ -91,6 +107,10 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut timeout_secs = DEFAULT_VM_TIMEOUT_SECS;
     let mut shell = false;
     let mut report = None;
+    let mut disk = None;
+    let mut cmdline = None;
+    let mut framebuffer = None;
+    let mut screenshot = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -106,6 +126,10 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--ram-mib" => ram_mib = positive(option, value)?,
             "--timeout-secs" => timeout_secs = positive(option, value)?,
             "--report" => report = Some((*value).to_owned()),
+            "--disk" => disk = Some((*value).to_owned()),
+            "--cmdline" => cmdline = Some((*value).to_owned()),
+            "--framebuffer" => framebuffer = Some(screen_size(value)?),
+            "--screenshot" => screenshot = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -116,7 +140,19 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         timeout_secs,
         shell,
         report,
+        disk,
+        cmdline,
+        framebuffer,
+        screenshot,
     }))
+}
+
+fn screen_size(value: &str) -> Result<(u16, u16), String> {
+    value
+        .split_once('x')
+        .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+        .filter(|&(width, height)| width > 0 && height > 0)
+        .ok_or_else(|| format!("--framebuffer needs a size like 1280x720, got {value}"))
 }
 
 fn positive(option: &str, value: &str) -> Result<usize, String> {
@@ -209,8 +245,31 @@ mod tests {
                 timeout_secs: DEFAULT_VM_TIMEOUT_SECS,
                 shell: true,
                 report: None,
+                disk: None,
+                cmdline: None,
+                framebuffer: None,
+                screenshot: None,
             }))
         );
+    }
+
+    #[test]
+    fn input_check_takes_a_path() {
+        assert_eq!(
+            run(&["input", "check", "p.json"]),
+            Ok(Command::InputCheck {
+                profile: "p.json".to_owned()
+            })
+        );
+        assert!(run(&["input", "check"]).is_err());
+    }
+
+    #[test]
+    fn screen_sizes_parse() {
+        assert_eq!(screen_size("1280x720"), Ok((1280, 720)));
+        for bad in ["1280", "0x720", "ax720", "70000x1", "1280x"] {
+            assert!(screen_size(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -17,16 +17,34 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 |---|---|
 | Alpine Linux 3.24 `virt` kernel 6.18 to user space | **Tested**, 512 MiB, one vCPU |
 | Interactive shell over serial | **Tested** |
-| Disk, network, multiple vCPUs, graphics | Not implemented |
+| Disk as `/dev/vda`, legacy virtio-blk over PCI | **Tested**: read and write verified from the host |
+| Network, multiple vCPUs, graphics | Not implemented |
 
 ## Android guest
 
 | Item | Status |
 |---|---|
-| Android boot | Not started |
-| ART | Not started |
+| Android 9 (Android-x86 9.0-r2) full boot | **Tested**: 2 GB, one vCPU, `sys.boot_completed` set, setup screen drawn |
+| ART and system apps | **Tested**: `system_server` and the setup wizard run |
+| Touch, keyboard, or mouse in Android | Not implemented |
+| Network, audio | Not implemented |
+| Installing or running an app of our own | Not tested |
+| Software rendering | **Tested**, for booting only. Never a gaming path |
 | Hardware OpenGL ES | Not started |
 | Hardware Vulkan | Not started |
+
+## Free Fire and BGMI
+
+Goals, not support claims. See [ADR-0007](ADR/0007-game-goals-and-input.md).
+
+| Item | Free Fire | BGMI |
+|---|---|---|
+| Runs on RAX | **Not tested** | **Not tested, and blocked** |
+| Native x86 build | Not confirmed | None listed, `arm64-v8a` only |
+| Emulator rules | Reported separate pool and leaderboard exclusion | Reported banned from competitive events |
+| Key mapping | Engine tested alone, positions not set | Engine tested alone, positions not set |
+
+Your account carries the risk of following or breaking each game's rules. RAX does not hide from anti-cheat, and has no macros.
 
 ## Minecraft Bedrock (Android)
 

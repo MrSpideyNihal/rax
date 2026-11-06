@@ -1,6 +1,7 @@
 //! Command implementations.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,7 @@ use rax_host::assess::{self, Finding, Probes, Severity};
 use rax_host::host::{self, HostInfo};
 use rax_host::vulkan::{self, Device};
 use rax_host::whp::{self, Capabilities, ExitLatency, MapCost};
+use rax_vmm::framebuffer::Framebuffer;
 use rax_vmm::machine::{self, Config, Outcome, Report};
 use serde::Serialize;
 
@@ -27,6 +29,7 @@ pub fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             out,
         } => bench_whp(iterations, map_mib, out.as_deref()),
         Command::VmRun(options) => vm_run(&options),
+        Command::InputCheck { profile } => input_check(&profile),
         Command::Help | Command::Version => unreachable!("handled in main"),
     }
 }
@@ -162,6 +165,18 @@ struct VmRunResult {
     run: Report,
 }
 
+fn input_check(path: &str) -> Result<ExitCode, Box<dyn Error>> {
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("could not read {path}: {error}"))?;
+    let profile = rax_input::Profile::from_json(&text)?;
+    println!(
+        "{}: {} bindings, valid",
+        profile.name,
+        profile.bindings.len()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
     let read =
         |path: &str| std::fs::read(path).map_err(|error| format!("could not read {path}: {error}"));
@@ -171,6 +186,13 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         ram_mib: options.ram_mib,
         timeout: Duration::from_secs(options.timeout_secs as u64),
         shell: options.shell,
+        disk: options.disk.as_ref().map(PathBuf::from),
+        init_script: None,
+        own_init_cmdline: options.cmdline.clone(),
+        framebuffer: options
+            .framebuffer
+            .map(|(width, height)| Framebuffer { width, height }),
+        screenshot: options.screenshot.as_ref().map(PathBuf::from),
     })?;
     eprintln!(
         "\nguest stopped: {:?}, user space after {} ms, {} exits, {} interrupts",

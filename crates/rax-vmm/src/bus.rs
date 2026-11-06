@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::pci::{Pci, VIRTIO_IRQ};
 use crate::pic::Pic;
 use crate::pit::Pit;
 use crate::rtc::Rtc;
 use crate::serial::{Serial, Sink};
+use crate::virtio_blk::{GuestMemory, VirtioBlk};
 
 const IRQ_TIMER: u8 = 0;
 const IRQ_SERIAL: u8 = 4;
@@ -25,6 +27,9 @@ const PIC2_COMMAND: u16 = 0xa0;
 const PIC2_DATA: u16 = 0xa1;
 const COM1_START: u16 = 0x3f8;
 const COM1_END: u16 = 0x3ff;
+const PCI_ADDRESS: u16 = 0xcf8;
+const PCI_DATA_START: u16 = 0xcfc;
+const PCI_DATA_END: u16 = 0xcff;
 
 const KEYBOARD_PULSE_RESET: u8 = 0xfe;
 /// What an unclaimed ISA port returns.
@@ -41,6 +46,12 @@ pub struct IoStats {
     pub clock: u64,
     /// Accesses to the PICs.
     pub interrupt_controller: u64,
+    /// Accesses to PCI configuration space.
+    pub pci: u64,
+    /// Accesses to the disk registers.
+    pub disk: u64,
+    /// Disk requests completed.
+    pub disk_requests: u64,
     /// Accesses to ports with no device.
     pub unclaimed: u64,
 }
@@ -53,6 +64,8 @@ pub struct Bus {
     rtc: Rtc,
     wall_clock: fn() -> u64,
     serial: Serial,
+    pci: Pci,
+    disk: Option<VirtioBlk>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -61,7 +74,7 @@ pub struct Bus {
 impl Bus {
     /// Creates the machine's devices.
     #[must_use]
-    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64) -> Self {
+    pub fn new(console: Box<dyn Sink>, wall_clock: fn() -> u64, disk: Option<VirtioBlk>) -> Self {
         Self {
             pic: Pic::default(),
             slave_pic: Pic::default(),
@@ -69,6 +82,8 @@ impl Bus {
             rtc: Rtc::default(),
             wall_clock,
             serial: Serial::new(console),
+            pci: Pci::new(disk.is_some()),
+            disk,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
@@ -115,10 +130,24 @@ impl Bus {
                 self.collect_serial_irq();
                 u32::from(byte)
             }
-            _ => {
-                self.count_unclaimed(port);
-                FLOATING_BUS
+            PCI_ADDRESS => {
+                self.stats.pci += 1;
+                self.pci.read_address()
             }
+            PCI_DATA_START..=PCI_DATA_END => {
+                self.stats.pci += 1;
+                self.pci.read_data(port - PCI_DATA_START, size)
+            }
+            _ => match (self.pci.virtio_offset(port), self.disk.as_mut()) {
+                (Some(offset), Some(disk)) => {
+                    self.stats.disk += 1;
+                    disk.read(offset, size)
+                }
+                _ => {
+                    self.count_unclaimed(port);
+                    FLOATING_BUS
+                }
+            },
         };
         match size {
             1 => value & 0xff,
@@ -128,7 +157,7 @@ impl Bus {
     }
 
     /// Handles `out`.
-    pub fn write(&mut self, port: u16, value: u32, now_ns: u64) {
+    pub fn write(&mut self, port: u16, size: u8, value: u32, now_ns: u64) {
         let byte = value as u8;
         match port {
             PIC1_COMMAND => {
@@ -170,7 +199,21 @@ impl Bus {
                 self.serial.write(port - COM1_START, byte);
                 self.collect_serial_irq();
             }
-            _ => self.count_unclaimed(port),
+            PCI_ADDRESS => {
+                self.stats.pci += 1;
+                self.pci.write_address(value);
+            }
+            PCI_DATA_START..=PCI_DATA_END => {
+                self.stats.pci += 1;
+                self.pci.write_data(port - PCI_DATA_START, size, value);
+            }
+            _ => match (self.pci.virtio_offset(port), self.disk.as_mut()) {
+                (Some(offset), Some(disk)) => {
+                    self.stats.disk += 1;
+                    disk.write(offset, value);
+                }
+                _ => self.count_unclaimed(port),
+            },
         }
     }
 
@@ -186,6 +229,18 @@ impl Bus {
         ports.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
         ports.truncate(limit);
         ports
+    }
+
+    /// Runs any disk requests the guest has queued. Call after a port write,
+    /// while the vCPU is stopped.
+    pub fn service_disk(&mut self, memory: &dyn GuestMemory) {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.service(memory);
+            self.stats.disk_requests = disk.requests();
+            if disk.take_irq() {
+                self.pic.raise(VIRTIO_IRQ);
+            }
+        }
     }
 
     fn collect_serial_irq(&mut self) {
@@ -254,7 +309,7 @@ mod tests {
 
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
-        (Bus::new(Box::new(capture.clone()), || 0), capture)
+        (Bus::new(Box::new(capture.clone()), || 0, None), capture)
     }
 
     fn init_pic(bus: &mut Bus) {
@@ -265,14 +320,14 @@ mod tests {
             (0x21, 0x01),
             (0x21, 0x00),
         ] {
-            bus.write(port, value, 0);
+            bus.write(port, 1, value, 0);
         }
     }
 
     #[test]
     fn serial_output_reaches_the_console() {
         let (mut bus, capture) = bus();
-        bus.write(0x3f8, u32::from(b'A'), 0);
+        bus.write(0x3f8, 1, u32::from(b'A'), 0);
         assert_eq!(*capture.0.lock().unwrap(), b"A");
         assert_eq!(bus.stats().serial, 1);
     }
@@ -281,16 +336,16 @@ mod tests {
     fn unclaimed_ports_float_high_and_are_counted() {
         let (mut bus, _) = bus();
         assert_eq!(bus.read(0x2f8, 1, 0), 0xff);
-        assert_eq!(bus.read(0xcfc, 4, 0), 0xffff_ffff);
-        bus.write(0x80, 0, 0);
+        assert_eq!(bus.read(0xe000, 4, 0), 0xffff_ffff);
+        bus.write(0x80, 1, 0, 0);
         assert_eq!(bus.stats().unclaimed, 3);
     }
 
     #[test]
     fn busiest_unclaimed_ports_are_ranked() {
         let (mut bus, _) = bus();
-        bus.write(0x80, 0, 0);
-        bus.write(0x80, 0, 0);
+        bus.write(0x80, 1, 0, 0);
+        bus.write(0x80, 1, 0, 0);
         bus.read(0x2f8, 1, 0);
         assert_eq!(
             bus.busiest_unclaimed_ports(1),
@@ -303,9 +358,9 @@ mod tests {
     fn timer_interrupts_flow_through_the_pic() {
         let (mut bus, _) = bus();
         init_pic(&mut bus);
-        bus.write(0x43, 0b0011_0100, 0);
-        bus.write(0x40, 0x9c, 0);
-        bus.write(0x40, 0x2e, 0); // 11932 ticks, about 10 ms.
+        bus.write(0x43, 1, 0b0011_0100, 0);
+        bus.write(0x40, 1, 0x9c, 0);
+        bus.write(0x40, 1, 0x2e, 0); // 11932 ticks, about 10 ms.
         assert!(!bus.tick(1_000_000));
         assert!(bus.tick(11_000_000));
         assert_eq!(bus.pending_vector(), Some(0x30));
@@ -317,7 +372,7 @@ mod tests {
     fn console_input_raises_the_serial_irq() {
         let (mut bus, _) = bus();
         init_pic(&mut bus);
-        bus.write(0x3f9, 0x01, 0); // Enable RX interrupts.
+        bus.write(0x3f9, 1, 0x01, 0); // Enable RX interrupts.
         bus.console_input(b"a");
         assert_eq!(bus.pending_vector(), Some(0x34));
         assert_eq!(bus.read(0x3f8, 1, 0), u32::from(b'a'));
@@ -326,7 +381,7 @@ mod tests {
     #[test]
     fn the_clock_never_looks_busy() {
         let (mut bus, _) = bus();
-        bus.write(0x70, 0x0a, 0);
+        bus.write(0x70, 1, 0x0a, 0);
         assert_eq!(bus.read(0x71, 1, 0) & 0x80, 0);
         assert_eq!(bus.stats().unclaimed, 0);
     }
@@ -334,9 +389,9 @@ mod tests {
     #[test]
     fn keyboard_controller_reset_is_reported() {
         let (mut bus, _) = bus();
-        bus.write(0x64, 0xaa, 0);
+        bus.write(0x64, 1, 0xaa, 0);
         assert!(!bus.reset_requested());
-        bus.write(0x64, 0xfe, 0);
+        bus.write(0x64, 1, 0xfe, 0);
         assert!(bus.reset_requested());
     }
 }

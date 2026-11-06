@@ -127,6 +127,94 @@ The first results showed about 1 boot in 5 losing all user-space output. The fir
 
 Exits were not counted before the fix, but a trace showed the window request never clearing in any of 12 boots. After the fix, every boot took 125 to 153 window exits, and 30 of 30 boots kept their output. `crates/rax-vmm/tests/boot_linux.rs` boots real Linux ten times to guard against this. Left unfixed, the same delay could have added input latency in a game.
 
+### Guest disk throughput, 2026-11-06
+
+| | |
+|---|---|
+| Raw data | [`benchmarks/results/2026-11-06-disk`](../benchmarks/results/2026-11-06-disk), exit counts only. Speeds below were read from guest `dd` output |
+| Command | `sh scripts/disk-speed.sh`, 3 runs |
+| Guest | Same as above, 256 MiB raw image, legacy virtio-blk |
+| State | Not isolated |
+
+| Run | Write, 128 MiB with `fsync` | Cached read, 128 MiB |
+|---|---|---|
+| 1 | 296.9 MB/s | 1.1 GB/s |
+| 2 | 279.0 MB/s | 1.1 GB/s |
+| 3 | 299.5 MB/s | 1.2 GB/s |
+
+**The read column is not disk speed.** The guest dropped its own cache, but Windows was still holding the data it had just written. It measures the virtio path against host memory.
+
+The test writes zeros sequentially in 1 MiB blocks, so it says nothing about random I/O, or about how Android's storage workload will behave.
+
+### Android Studio emulator baseline, 2026-11-06
+
+This is the number RAX must beat. **It cannot be compared with the RAX results above, because RAX does not run Android yet.** A tiny Linux guest and Android 14 with Google Play do very different amounts of work.
+
+| | |
+|---|---|
+| Raw data | [`2026-11-06-android-emulator-baseline`](../benchmarks/results/2026-11-06-android-emulator-baseline), [`2026-11-06-android-emulator-settled`](../benchmarks/results/2026-11-06-android-emulator-settled) |
+| Command | `./scripts/measure-android-emulator.ps1 -Avd lf34` |
+| Emulator | Android Emulator 37.1.11.0 on WHPX, no window, cold boot, read-only |
+| Guest | Android 14 `google_apis_playstore` x86_64, 1.5 GB RAM, 4 vCPUs, 1080 x 2400, `hw.gpu.mode=auto` |
+| Host | Same laptop, on mains, about 7 GB of RAM available |
+| Game | None installed |
+
+| Measurement | Result |
+|---|---|
+| Boot until `sys.boot_completed` | 33.1 to 42.7 s, mean 38.0 s, 4 boots |
+| Host working set, all emulator processes | 3.6 GB, 3598 to 3619 MiB |
+| Host private memory | 4.2 GB, 4210 to 4253 MiB |
+| CPU 60 s after boot | 404% to 423% of one core, so **not idle**: all 4 vCPUs were busy |
+| CPU 5 minutes after boot | **56% of one core**, or 4.65% of all cores. One 60 s sample |
+
+Interpretation:
+
+- Always let Android settle before calling it idle. The early figure was about 7 times the settled one.
+- The cause of the post-boot work has not been identified. Google Play services probably contribute, which a trimmed guest would not have to run, but that is unverified.
+- Host memory is well above the 1.5 GB of guest RAM. What accounts for the difference has not been broken down.
+- With no window, this says nothing about rendering or FPS.
+
+### Android on RAX, 2026-11-06
+
+![Android setup screen on RAX](images/android-first-boot.png)
+
+The screenshot was saved by `--screenshot` from guest memory.
+
+| | |
+|---|---|
+| Raw data | [`benchmarks/results/2026-11-06-android-rax`](../benchmarks/results/2026-11-06-android-rax) |
+| Commands | `sh scripts/android-boot-time.sh SESSION 3 2048`, then `./scripts/measure-android-rax.ps1 -Session SESSION` |
+| Guest | Android-x86 9.0-r2, 2 GB RAM, 1 vCPU, 1280 x 720 framebuffer, software rendering, no Google apps |
+| Host | Same laptop, on mains, about 6.5 GB of RAM available |
+
+| Measurement | Result |
+|---|---|
+| Boot until `sys.boot_completed` | 52, 53 and 56 s, timed by the guest |
+| vCPU exits per boot | About 390,000 |
+| Host working set, idle | 2056 MiB |
+| Host private memory, idle | 2066 MiB, for 2048 MiB of guest RAM |
+| CPU, settled over 5 minutes | 7.26% of one core. One 60 s sample |
+
+### RAX beside the Android Studio emulator
+
+| | RAX | Android Studio emulator |
+|---|---|---|
+| Android version | 9, from 2020 | 14 |
+| Google Play services | No | Yes |
+| vCPUs | 1 | 4 |
+| Guest RAM | 2 GB | 1.5 GB |
+| Boot | 54 s | 38 s |
+| Host RAM, idle | 2.0 GB | 3.6 GB |
+| CPU, settled | 7.3% of one core | 56% of one core |
+
+**This is not a fair race, and it does not show that RAX is lighter.** Android 9 without Google Play services does much less than Android 14 with them, and RAX has no GPU path yet. Adding those will raise RAX's numbers. Neither column involves a game.
+
+What it does show:
+
+- RAX's own overhead is small: about 18 MiB of private memory above guest RAM, though no GPU forwarding is included.
+- RAX boots slower, using one vCPU. That result is against RAX, and more vCPUs should help.
+- The guest's RAM is all touched by the time it is idle, so guest size sets the host cost. Testing smaller guests and returning free memory are the obvious next steps.
+
 ## Planned
 
 | Measurement | Phase | Tool |

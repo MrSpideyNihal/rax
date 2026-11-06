@@ -41,9 +41,10 @@ flowchart TB
 | Component | State | Responsibility |
 |---|---|---|
 | `crates/rax-host` | **exists** | OS integration and all current `unsafe`: WHP, Vulkan probing, host facts, readiness rules, statistics |
-| `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT and RTC devices, one vCPU. Forbids `unsafe` |
-| `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`. Forbids `unsafe` |
-| virtio devices, multiple vCPUs | planned, Phase 1b | Required before Android can boot |
+| `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT, RTC, PCI and virtio-blk devices, one vCPU. Forbids `unsafe` |
+| `crates/rax-input` | **exists, not connected** | Key-mapping profiles, keyboard and mouse to touch events. Forbids `unsafe` |
+| `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`, `rax input check`. Forbids `unsafe` |
+| Multiple vCPUs, more virtio devices | planned, Phase 1b | Required before Android is usable |
 | Input bridge | planned, Phase 3 | Raw Input to virtio-input |
 | Launcher UI | planned, after the GPU pipeline | Small native window |
 | Guest image recipe | test guest **exists**, Android planned | `scripts/fetch-guest.ps1` fetches a pinned Alpine Linux guest. AOSP comes in Phase 1b |
@@ -60,13 +61,15 @@ The ring design matters because it limits VM exits. Exit cost is low (about 3 µ
 
 ### Input
 
+Two kinds of game need different paths. Games with keyboard support may get a real mouse and keyboard, and touch-only games such as Free Fire use the key-mapping engine in `rax-input`, which turns physical input into virtual fingers.
+
 Planned design, to be validated:
 
 ```
 Raw Input (WM_INPUT) --> rax.exe --> virtio-input --> guest evdev
 ```
 
-The hypothesis is that Android apps should see a **real mouse and keyboard**, not synthesized touch, because that removes a translation layer. Android supports pointer capture, and Minecraft on ChromeOS suggests keyboard and mouse handling exists in the game. This is unverified for Bedrock on Android. Touch mapping is the fallback only.
+The hypothesis is that Android apps should see a **real mouse and keyboard**, not synthesized touch, because that removes a translation layer. Android supports pointer capture, and Minecraft on ChromeOS suggests keyboard and mouse handling exists in the game. This is unverified for Bedrock on Android. Touch mapping is required for touch-only games. Keyboard and mouse state stay independent, so one device leaving never affects the other ([ADR-0007](ADR/0007-game-goals-and-input.md)).
 
 ### Memory
 
@@ -76,11 +79,19 @@ Guest RAM is mapped from host-committed regions through `WHvMapGpaRange`. Reclai
 
 A single process with no installed service. The vCPU runs on the main thread, one thread drives time and console input, and the VM ends with the process. Suspend and resume are investigated later.
 
+### Display
+
+The guest draws into a linear framebuffer described through `screen_info`, so the kernel's VESA driver needs no device behind it. Android renders in software. `--screenshot` saves the buffer as a BMP, and there is no live window yet. This exists to boot and to see the guest. It is not the gaming graphics path, which remains unsolved.
+
+### Storage
+
+Disk requests run on the vCPU thread during the notifying `out` exit, so a slow host disk stalls the guest. Everything the guest supplies is untrusted: descriptor indexes, chain lengths, addresses, and sizes are all checked, and a malformed ring stops the queue rather than panicking. Moving I/O off the vCPU thread is future work, to be justified by measurement.
+
 ### Boot
 
 RAX boots Linux directly, with no BIOS. It loads the `bzImage` payload, writes `boot_params` with an E820 memory map, adds an init script to the initramfs as a concatenated cpio archive, and enters the kernel's 32-bit entry point. The kernel switches itself to long mode.
 
-Devices are a 16550A serial port, master 8259A PIC, 8254 PIT, and CMOS RTC. Interrupts are injected through the hypervisor's pending-interruption register, and an interrupt-window exit is requested when the guest cannot accept one yet. Reads of absent hardware map a read-only page of `0xFF`, matching what an unclaimed bus returns, so no instruction decoder is needed so far.
+Devices are a 16550A serial port, master 8259A PIC, 8254 PIT, CMOS RTC, and a PCI bus holding one legacy virtio block device. Legacy virtio was chosen because its registers are port I/O, which avoids needing an MMIO instruction decoder. Interrupts are injected through the hypervisor's pending-interruption register, and an interrupt-window exit is requested when the guest cannot accept one yet. Reads of absent hardware map a read-only page of `0xFF`, matching what an unclaimed bus returns, so no instruction decoder is needed so far.
 
 ## Hypervisor
 
