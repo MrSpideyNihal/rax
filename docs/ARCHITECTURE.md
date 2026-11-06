@@ -79,6 +79,10 @@ Guest RAM is mapped from host-committed regions through `WHvMapGpaRange`. Reclai
 
 A single process with no installed service. The vCPU runs on the main thread, one thread drives time and console input, and the VM ends with the process. Suspend and resume are investigated later.
 
+### Display
+
+The guest draws into a linear framebuffer described through `screen_info`, so the kernel's VESA driver needs no device behind it. Android renders in software. `--screenshot` saves the buffer as a BMP, and there is no live window yet. This exists to boot and to see the guest. It is not the gaming graphics path, which remains unsolved.
+
 ### Storage
 
 Disk requests run on the vCPU thread during the notifying `out` exit, so a slow host disk stalls the guest. Everything the guest supplies is untrusted: descriptor indexes, chain lengths, addresses, and sizes are all checked, and a malformed ring stops the queue rather than panicking. Moving I/O off the vCPU thread is future work, to be justified by measurement.
