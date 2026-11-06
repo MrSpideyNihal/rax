@@ -26,7 +26,7 @@ impl<'a> Vm<'a> {
         let partition = Partition::new(api, 1)?;
         map_guest_ram(&partition, &ram)?;
         partition.create_processor(0)?;
-        let mut floating_page = GuestRegion::new(PAGE)?;
+        let floating_page = GuestRegion::new(PAGE)?;
         floating_page.write_at(0, &[0xff; PAGE])?;
         Ok(Self {
             partition,
@@ -36,8 +36,13 @@ impl<'a> Vm<'a> {
     }
 
     /// Copies `bytes` into guest RAM at `gpa`.
-    pub fn write_ram(&mut self, gpa: u64, bytes: &[u8]) -> Result<()> {
+    pub fn write_ram(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
         self.ram.write_at(gpa, bytes)
+    }
+
+    /// Fills `buffer` from guest RAM at `gpa`.
+    pub fn read_ram(&self, gpa: u64, buffer: &mut [u8]) -> Result<()> {
+        self.ram.read_at(gpa, buffer)
     }
 
     /// Makes reads of the page holding `gpa` return all ones, as reads of an

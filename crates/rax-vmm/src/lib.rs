@@ -9,10 +9,12 @@
 pub mod boot;
 pub mod bus;
 pub mod cpio;
+pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod serial;
+pub mod virtio_blk;
 
 #[cfg(windows)]
 pub mod machine;

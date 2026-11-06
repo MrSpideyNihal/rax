@@ -127,6 +127,25 @@ The first results showed about 1 boot in 5 losing all user-space output. The fir
 
 Exits were not counted before the fix, but a trace showed the window request never clearing in any of 12 boots. After the fix, every boot took 125 to 153 window exits, and 30 of 30 boots kept their output. `crates/rax-vmm/tests/boot_linux.rs` boots real Linux ten times to guard against this. Left unfixed, the same delay could have added input latency in a game.
 
+### Guest disk throughput, 2026-11-06
+
+| | |
+|---|---|
+| Raw data | [`benchmarks/results/2026-11-06-disk`](../benchmarks/results/2026-11-06-disk), exit counts only. Speeds below were read from guest `dd` output |
+| Command | `sh scripts/disk-speed.sh`, 3 runs |
+| Guest | Same as above, 256 MiB raw image, legacy virtio-blk |
+| State | Not isolated |
+
+| Run | Write, 128 MiB with `fsync` | Cached read, 128 MiB |
+|---|---|---|
+| 1 | 296.9 MB/s | 1.1 GB/s |
+| 2 | 279.0 MB/s | 1.1 GB/s |
+| 3 | 299.5 MB/s | 1.2 GB/s |
+
+**The read column is not disk speed.** The guest dropped its own cache, but Windows was still holding the data it had just written. It measures the virtio path against host memory.
+
+The test writes zeros sequentially in 1 MiB blocks, so it says nothing about random I/O, or about how Android's storage workload will behave.
+
 ## Planned
 
 | Measurement | Phase | Tool |

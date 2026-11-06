@@ -1,6 +1,7 @@
 //! Command implementations.
 
 use std::error::Error;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -171,6 +172,8 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         ram_mib: options.ram_mib,
         timeout: Duration::from_secs(options.timeout_secs as u64),
         shell: options.shell,
+        disk: options.disk.as_ref().map(PathBuf::from),
+        init_script: None,
     })?;
     eprintln!(
         "\nguest stopped: {:?}, user space after {} ms, {} exits, {} interrupts",

@@ -17,7 +17,8 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 |---|---|
 | Alpine Linux 3.24 `virt` kernel 6.18 to user space | **Tested**, 512 MiB, one vCPU |
 | Interactive shell over serial | **Tested** |
-| Disk, network, multiple vCPUs, graphics | Not implemented |
+| Disk as `/dev/vda`, legacy virtio-blk over PCI | **Tested**: read and write verified from the host |
+| Network, multiple vCPUs, graphics | Not implemented |
 
 ## Android guest
 

@@ -41,9 +41,9 @@ flowchart TB
 | Component | State | Responsibility |
 |---|---|---|
 | `crates/rax-host` | **exists** | OS integration and all current `unsafe`: WHP, Vulkan probing, host facts, readiness rules, statistics |
-| `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT and RTC devices, one vCPU. Forbids `unsafe` |
+| `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT, RTC, PCI and virtio-blk devices, one vCPU. Forbids `unsafe` |
 | `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`. Forbids `unsafe` |
-| virtio devices, multiple vCPUs | planned, Phase 1b | Required before Android can boot |
+| Multiple vCPUs, more virtio devices | planned, Phase 1b | Required before Android is usable |
 | Input bridge | planned, Phase 3 | Raw Input to virtio-input |
 | Launcher UI | planned, after the GPU pipeline | Small native window |
 | Guest image recipe | test guest **exists**, Android planned | `scripts/fetch-guest.ps1` fetches a pinned Alpine Linux guest. AOSP comes in Phase 1b |
@@ -76,11 +76,15 @@ Guest RAM is mapped from host-committed regions through `WHvMapGpaRange`. Reclai
 
 A single process with no installed service. The vCPU runs on the main thread, one thread drives time and console input, and the VM ends with the process. Suspend and resume are investigated later.
 
+### Storage
+
+Disk requests run on the vCPU thread during the notifying `out` exit, so a slow host disk stalls the guest. Everything the guest supplies is untrusted: descriptor indexes, chain lengths, addresses, and sizes are all checked, and a malformed ring stops the queue rather than panicking. Moving I/O off the vCPU thread is future work, to be justified by measurement.
+
 ### Boot
 
 RAX boots Linux directly, with no BIOS. It loads the `bzImage` payload, writes `boot_params` with an E820 memory map, adds an init script to the initramfs as a concatenated cpio archive, and enters the kernel's 32-bit entry point. The kernel switches itself to long mode.
 
-Devices are a 16550A serial port, master 8259A PIC, 8254 PIT, and CMOS RTC. Interrupts are injected through the hypervisor's pending-interruption register, and an interrupt-window exit is requested when the guest cannot accept one yet. Reads of absent hardware map a read-only page of `0xFF`, matching what an unclaimed bus returns, so no instruction decoder is needed so far.
+Devices are a 16550A serial port, master 8259A PIC, 8254 PIT, CMOS RTC, and a PCI bus holding one legacy virtio block device. Legacy virtio was chosen because its registers are port I/O, which avoids needing an MMIO instruction decoder. Interrupts are injected through the hypervisor's pending-interruption register, and an interrupt-window exit is requested when the guest cannot accept one yet. Reads of absent hardware map a read-only page of `0xFF`, matching what an unclaimed bus returns, so no instruction decoder is needed so far.
 
 ## Hypervisor
 

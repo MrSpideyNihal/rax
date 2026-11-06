@@ -45,6 +45,8 @@ pub struct VmRun {
     pub shell: bool,
     /// File to write the JSON report to.
     pub report: Option<String>,
+    /// Raw disk image for the guest.
+    pub disk: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
@@ -91,6 +93,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut timeout_secs = DEFAULT_VM_TIMEOUT_SECS;
     let mut shell = false;
     let mut report = None;
+    let mut disk = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -106,6 +109,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--ram-mib" => ram_mib = positive(option, value)?,
             "--timeout-secs" => timeout_secs = positive(option, value)?,
             "--report" => report = Some((*value).to_owned()),
+            "--disk" => disk = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -116,6 +120,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         timeout_secs,
         shell,
         report,
+        disk,
     }))
 }
 
@@ -209,6 +214,7 @@ mod tests {
                 timeout_secs: DEFAULT_VM_TIMEOUT_SECS,
                 shell: true,
                 report: None,
+                disk: None,
             }))
         );
     }

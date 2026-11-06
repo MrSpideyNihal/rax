@@ -1,7 +1,9 @@
 //! Assembles a guest and runs its vCPU.
 
 use std::error::Error;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
@@ -15,12 +17,15 @@ use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
 use crate::serial::Sink;
+use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
 
 /// Printed by the guest once user space is running.
 const READY_MARKER: &[u8] = b"RAX_GUEST_READY";
 const INIT_PATH: &str = "rax-init";
 const BASE_CMDLINE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200 nolapic noapic \
-    acpi=off pci=off nosmp reboot=k panic=-1 i8042.noaux tsc=reliable rdinit=/rax-init";
+    acpi=off nosmp reboot=k panic=-1 i8042.noaux tsc=reliable rdinit=/rax-init";
+/// Skips the bus scan when there is nothing on it.
+const NO_PCI: &str = " pci=off";
 /// How long the timer thread sleeps when nothing is due sooner.
 const TIMER_IDLE: Duration = Duration::from_millis(1);
 
@@ -38,6 +43,9 @@ const SHELL_INIT: &str = "#!/bin/busybox sh
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 mount -t proc proc /proc
 mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+modprobe virtio_pci
+modprobe virtio_blk
 echo RAX_GUEST_READY
 setsid -c sh
 poweroff -f
@@ -56,6 +64,10 @@ pub struct Config {
     pub timeout: Duration,
     /// Give the host's stdin to a guest shell, instead of a smoke test.
     pub shell: bool,
+    /// A raw disk image, shown to the guest as `/dev/vda`. Writes are kept.
+    pub disk: Option<PathBuf>,
+    /// Replaces the built-in init script.
+    pub init_script: Option<String>,
 }
 
 /// How the guest stopped.
@@ -203,6 +215,19 @@ fn spawn_stdin_reader() -> Receiver<Vec<u8>> {
     receiver
 }
 
+/// Guest RAM for devices. Only used while the vCPU is stopped at an exit.
+struct RamView<'a, 'b>(&'a Vm<'b>);
+
+impl GuestMemory for RamView<'_, '_> {
+    fn read(&self, gpa: u64, buffer: &mut [u8]) -> Result<(), OutOfRange> {
+        self.0.read_ram(gpa, buffer).map_err(|_| OutOfRange)
+    }
+
+    fn write(&self, gpa: u64, bytes: &[u8]) -> Result<(), OutOfRange> {
+        self.0.write_ram(gpa, bytes).map_err(|_| OutOfRange)
+    }
+}
+
 /// What to do about interrupts before the vCPU next runs.
 #[derive(Debug, PartialEq, Eq)]
 enum Delivery {
@@ -276,13 +301,12 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                     .read(port, size, now);
                 vm.finish_port_read(&info, size, value)?;
             }
-            VmExit::PortWrite { port, value, .. } => {
+            VmExit::PortWrite { port, size, value } => {
                 let now = shared.now_ns();
-                shared
-                    .bus
-                    .lock()
-                    .map_err(|_| "device lock poisoned")?
-                    .write(port, value, now);
+                let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+                bus.write(port, size, value, now);
+                bus.service_disk(&RamView(vm));
+                drop(bus);
                 vm.skip_instruction(&info)?;
             }
             VmExit::Halted => {
@@ -327,11 +351,25 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
     }
 }
 
-fn command_line(api: &Api) -> String {
-    match vm::tsc_hz(api) {
-        Some(hz) => format!("{BASE_CMDLINE} tsc_early_khz={}", hz / 1000),
-        None => BASE_CMDLINE.to_owned(),
+fn command_line(api: &Api, has_disk: bool) -> String {
+    let mut line = BASE_CMDLINE.to_owned();
+    if !has_disk {
+        line.push_str(NO_PCI);
     }
+    if let Some(hz) = vm::tsc_hz(api) {
+        line.push_str(&format!(" tsc_early_khz={}", hz / 1000));
+    }
+    line
+}
+
+fn open_disk(path: &PathBuf) -> Result<VirtioBlk, Box<dyn Error>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("could not open disk {}: {error}", path.display()))?;
+    let size = file.metadata()?.len();
+    Ok(VirtioBlk::new(Box::new(file), size))
 }
 
 /// Boots the guest and runs it until it stops.
@@ -342,17 +380,21 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let kernel = BzImage::parse(&config.kernel)?;
 
     let mut initrd = config.initrd;
-    let script = if config.shell { SHELL_INIT } else { SMOKE_INIT };
+    let built_in = if config.shell { SHELL_INIT } else { SMOKE_INIT };
+    let script = config.init_script.as_deref().unwrap_or(built_in);
     cpio::concatenate(
         &mut initrd,
         &cpio::single_executable(INIT_PATH, script.as_bytes()),
     );
     let initrd_gpa = kernel.initrd_address(initrd.len(), ram_bytes)?;
 
-    let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
+    let disk = config.disk.as_ref().map(open_disk).transpose()?;
+    let cmdline = command_line(&api, disk.is_some());
+
+    let vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
     vm.write_ram(kernel.load_address(), kernel.payload())?;
     vm.write_ram(initrd_gpa, &initrd)?;
-    vm.write_ram(CMDLINE_GPA, &boot::cmdline_bytes(&command_line(&api))?)?;
+    vm.write_ram(CMDLINE_GPA, &boot::cmdline_bytes(&cmdline)?)?;
     let params = kernel.boot_params(ram_bytes, Some((initrd_gpa, initrd.len())))?;
     vm.write_ram(BOOT_PARAMS_GPA, &params)?;
     vm.enter_protected_mode(kernel.load_address(), BOOT_PARAMS_GPA)?;
@@ -367,7 +409,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let started = Instant::now();
     let deadline = started + config.timeout;
     let shared = Shared {
-        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds)),
+        bus: Mutex::new(Bus::new(Box::new(console), unix_seconds, disk)),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,

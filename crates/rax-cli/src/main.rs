@@ -16,7 +16,7 @@ USAGE:
     rax doctor [--json]
     rax bench whp [--iterations N] [--map-mib N] [--out FILE]
     rax vm run --kernel FILE --initrd FILE [--ram-mib N] [--timeout-secs N]
-               [--shell] [--report FILE]
+               [--shell] [--disk FILE] [--report FILE]
     rax --version
     rax --help
 

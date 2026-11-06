@@ -36,6 +36,8 @@ fn user_space_output_survives_repeated_boots() {
             ram_mib: 512,
             timeout: Duration::from_secs(30),
             shell: false,
+            disk: None,
+            init_script: None,
         })
         .expect("guest runs");
         assert_eq!(report.outcome, Outcome::PoweredOff, "attempt {attempt}");
@@ -48,4 +50,45 @@ fn user_space_output_survives_repeated_boots() {
             "attempt {attempt} never saw an interrupt window"
         );
     }
+}
+
+const COPY_SECTOR_SCRIPT: &str = "#!/bin/busybox sh
+/bin/busybox --install -s
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t devtmpfs dev /dev
+modprobe virtio_pci
+modprobe virtio_blk
+dd if=/dev/vda of=/dev/vda bs=512 count=1 seek=1 conv=notrunc,fsync
+poweroff -f
+";
+
+/// Proves the whole path: PCI discovery, the virtio ring, interrupts, and
+/// both directions of data. The guest copies sector 0 over sector 1, so the
+/// host only sees the pattern there if a read and a write both worked.
+#[test]
+#[ignore = "requires Windows Hypervisor Platform and guest files"]
+fn guest_reads_and_writes_the_disk() {
+    let path = std::env::temp_dir().join(format!("rax-disk-test-{}.img", std::process::id()));
+    let mut image = vec![0_u8; 1024 * 1024];
+    image[..512].fill(0x5a);
+    std::fs::write(&path, &image).expect("disk image");
+
+    let report = machine::run(Config {
+        kernel: guest_file("vmlinuz-virt"),
+        initrd: guest_file("initramfs-virt"),
+        ram_mib: 512,
+        timeout: Duration::from_secs(30),
+        shell: false,
+        disk: Some(path.clone()),
+        init_script: Some(COPY_SECTOR_SCRIPT.to_owned()),
+    })
+    .expect("guest runs");
+
+    let after = std::fs::read(&path).expect("disk image");
+    std::fs::remove_file(&path).expect("cleanup");
+    assert_eq!(report.outcome, Outcome::PoweredOff);
+    assert!(report.io.disk_requests > 0, "guest never used the disk");
+    assert!(after[512..1024].iter().all(|&byte| byte == 0x5a));
+    assert!(after[1024..].iter().all(|&byte| byte == 0));
 }

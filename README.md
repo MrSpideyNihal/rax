@@ -13,7 +13,7 @@
 |---|---|
 | `rax doctor` | Checks WHP, RAM, CPU, and GPUs, and explains blockers |
 | `rax bench whp` | Runs a tiny guest under the Windows Hypervisor Platform and measures VM-exit and mapping costs |
-| `rax vm run` | Boots Linux on RAX's own Rust VMM, with a serial console or an interactive shell |
+| `rax vm run` | Boots Linux on RAX's own Rust VMM, with a serial console or shell, and optionally a virtual disk |
 
 Results on the target laptop (Ryzen 7 7445HS, Windows 11 Home, VBS on):
 

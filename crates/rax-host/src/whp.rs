@@ -328,15 +328,6 @@ impl GuestRegion {
             }
         }
     }
-
-    fn write(&mut self, bytes: &[u8]) {
-        assert!(bytes.len() <= self.size);
-        // SAFETY: the bounds were checked above, `self` is exclusively
-        // borrowed, and the source cannot overlap a private allocation.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.as_ptr().cast(), bytes.len());
-        }
-    }
 }
 
 impl Drop for GuestRegion {
@@ -351,16 +342,34 @@ impl Drop for GuestRegion {
 
 impl GuestRegion {
     /// Copies `bytes` to offset `gpa`, checking bounds.
-    pub(crate) fn write_at(&mut self, gpa: u64, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn write_at(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
         let offset = crate::vm::check_range(gpa, bytes.len(), self.size)?;
         // SAFETY: `check_range` proved the destination lies inside this
-        // allocation, `self` is exclusively borrowed so the vCPU API cannot
-        // be running through `Vm`, and the source cannot overlap it.
+        // allocation. `Vm` is not `Sync` and has one vCPU, which runs only
+        // inside `Vm::run` on this same thread, so nothing else touches the
+        // memory now. The source cannot overlap a private allocation.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
                 self.base.as_ptr().cast::<u8>().add(offset),
                 bytes.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl GuestRegion {
+    /// Fills `buffer` from offset `gpa`, checking bounds.
+    pub(crate) fn read_at(&self, gpa: u64, buffer: &mut [u8]) -> Result<()> {
+        let offset = crate::vm::check_range(gpa, buffer.len(), self.size)?;
+        // SAFETY: as for `write_at`, with the roles of source and destination
+        // swapped. `buffer` is exclusively borrowed.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base.as_ptr().cast::<u8>().add(offset),
+                buffer.as_mut_ptr(),
+                buffer.len(),
             );
         }
         Ok(())
@@ -640,8 +649,8 @@ pub struct ExitLatency {
 /// a Windows-hosted VMM costs at least this, so it bounds how chatty the
 /// device model can afford to be.
 pub fn measure_exit_latency(api: &Api, iterations: usize) -> Result<ExitLatency> {
-    let mut code = GuestRegion::new(PAGE)?;
-    code.write(&GUEST_CODE);
+    let code = GuestRegion::new(PAGE)?;
+    code.write_at(0, &GUEST_CODE)?;
     let partition = Partition::new(api, 1)?;
     partition.map(&code, GUEST_CODE_GPA, MAP_READ | MAP_WRITE | MAP_EXECUTE)?;
     partition.create_processor(0)?;
