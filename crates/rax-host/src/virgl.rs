@@ -5,12 +5,15 @@
 //! contexts, which is how it runs on Windows. RAX creates them through WGL.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::marker::PhantomData;
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::dylib::Library;
+use crate::vm::check_range;
 use crate::{Error, Result};
 
 type Hwnd = *mut c_void;
@@ -31,6 +34,11 @@ const WGL_CONTEXT_MAJOR_VERSION: c_int = 0x2091;
 const WGL_CONTEXT_MINOR_VERSION: c_int = 0x2092;
 const WGL_CONTEXT_PROFILE_MASK: c_int = 0x9126;
 const WGL_CONTEXT_CORE_PROFILE_BIT: c_int = 1;
+const WGL_CONTEXT_FLAGS: c_int = 0x2094;
+const WGL_CONTEXT_DEBUG_BIT: c_int = 1;
+const GL_DEBUG_OUTPUT: u32 = 0x92e0;
+const GL_DEBUG_OUTPUT_SYNCHRONOUS: u32 = 0x8242;
+const GL_DEBUG_TYPE_ERROR: u32 = 0x824c;
 
 #[repr(C)]
 struct PixelFormatDescriptor {
@@ -104,6 +112,7 @@ unsafe extern "system" {
     fn wglMakeCurrent(hdc: Hdc, context: Hglrc) -> i32;
     fn wglGetProcAddress(name: *const c_char) -> *const c_void;
     fn glGetString(name: u32) -> *const c_char;
+    fn glEnable(capability: u32);
 }
 
 #[link(name = "kernel32")]
@@ -112,6 +121,8 @@ unsafe extern "system" {
 }
 
 type CreateContextAttribs = unsafe extern "system" fn(Hdc, Hglrc, *const c_int) -> Hglrc;
+type DebugMessage = extern "system" fn(u32, u32, u32, u32, c_int, *const c_char, *const c_void);
+type DebugCallback = unsafe extern "system" fn(DebugMessage, *const c_void);
 
 thread_local! {
     /// The device context virglrenderer's callbacks draw through.
@@ -131,11 +142,10 @@ extern "C" fn create_gl_context(
 ) -> *mut c_void {
     // SAFETY: virglrenderer passes a valid parameter block for this call.
     let param = unsafe { &*param };
-    let share = if param.shared {
-        SHARED.get()
-    } else {
-        std::ptr::null_mut()
-    };
+    // The renderer asks for its first context unshared and expects later ones
+    // to share with it. Sharing them all with RAX's own context gives the
+    // same result: resources made in one are visible in the others.
+    let share = SHARED.get();
     let attributes = [
         WGL_CONTEXT_MAJOR_VERSION,
         param.major_version,
@@ -143,6 +153,8 @@ extern "C" fn create_gl_context(
         param.minor_version,
         WGL_CONTEXT_PROFILE_MASK,
         WGL_CONTEXT_CORE_PROFILE_BIT,
+        WGL_CONTEXT_FLAGS,
+        i32::from(gl_debug_wanted()) * WGL_CONTEXT_DEBUG_BIT,
         0,
     ];
     match CREATE.get() {
@@ -162,10 +174,50 @@ extern "C" fn destroy_gl_context(_cookie: *mut c_void, context: *mut c_void) {
 
 extern "C" fn make_current(_cookie: *mut c_void, _scanout: c_int, context: *mut c_void) -> c_int {
     // SAFETY: the device context is live, and a null context is allowed.
-    if unsafe { wglMakeCurrent(DEVICE.get(), context) } != 0 {
-        0
-    } else {
-        -1
+    if unsafe { wglMakeCurrent(DEVICE.get(), context) } == 0 {
+        return -1;
+    }
+    if !context.is_null() && gl_debug_wanted() {
+        listen_for_gl_errors();
+    }
+    0
+}
+
+fn gl_debug_wanted() -> bool {
+    std::env::var_os("RAX_GL_DEBUG").is_some()
+}
+
+extern "system" fn gl_message(
+    _source: u32,
+    kind: u32,
+    _id: u32,
+    _severity: u32,
+    _length: c_int,
+    message: *const c_char,
+    _user: *const c_void,
+) {
+    if kind == GL_DEBUG_TYPE_ERROR {
+        // SAFETY: the driver passes a NUL-terminated message.
+        let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+        eprintln!("gl: {text}");
+    }
+}
+
+/// Has the driver describe its errors in the current context.
+fn listen_for_gl_errors() {
+    // SAFETY: a context is current, and the name is NUL-terminated.
+    let address = unsafe { wglGetProcAddress(c"glDebugMessageCallback".as_ptr()) };
+    if address.is_null() {
+        return;
+    }
+    // SAFETY: the driver returned this address for that name, whose
+    // signature matches the alias.
+    let set = unsafe { std::mem::transmute::<*const c_void, DebugCallback>(address) };
+    // SAFETY: a context is current, and `gl_message` lives forever.
+    unsafe {
+        glEnable(GL_DEBUG_OUTPUT);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        set(gl_message, std::ptr::null());
     }
 }
 
@@ -307,12 +359,24 @@ type RendererInit = unsafe extern "C" fn(*mut c_void, c_int, *mut Callbacks) -> 
 type GetCapSet = unsafe extern "C" fn(u32, *mut u32, *mut u32);
 type Cleanup = unsafe extern "C" fn(*mut c_void);
 
-/// Starts virglrenderer from `folder` and reports what it can do.
-pub fn probe(folder: &Path) -> Result<Probe> {
-    let window = GlWindow::new()?;
+fn callbacks() -> Callbacks {
+    Callbacks {
+        version: CALLBACKS_VERSION,
+        write_fence,
+        create_gl_context,
+        destroy_gl_context,
+        make_current,
+        get_drm_fd: std::ptr::null(),
+        write_context_fence: std::ptr::null(),
+        get_server_fd: std::ptr::null(),
+        get_egl_display: std::ptr::null(),
+    }
+}
+
+/// Gives the context callbacks what they need on this thread.
+fn hook_up_contexts(window: &GlWindow) -> Result<()> {
     DEVICE.set(window.hdc);
     SHARED.set(window.context);
-
     // SAFETY: a context is current, and the name is NUL-terminated.
     let address = unsafe { wglGetProcAddress(c"wglCreateContextAttribsARB".as_ptr()) };
     if address.is_null() {
@@ -325,6 +389,13 @@ pub fn probe(folder: &Path) -> Result<Probe> {
     // signature matches the alias.
     let create = unsafe { std::mem::transmute::<*const c_void, CreateContextAttribs>(address) };
     CREATE.set(Some(create));
+    Ok(())
+}
+
+/// Starts virglrenderer from `folder` and reports what it can do.
+pub fn probe(folder: &Path) -> Result<Probe> {
+    let window = GlWindow::new()?;
+    hook_up_contexts(&window)?;
 
     let library = Library::load_from(&folder.join("libvirglrenderer-1.dll"))?;
     // SAFETY: each alias matches the signature in virglrenderer.h, and
@@ -337,17 +408,7 @@ pub fn probe(folder: &Path) -> Result<Probe> {
         )
     };
 
-    let mut callbacks = Callbacks {
-        version: CALLBACKS_VERSION,
-        write_fence,
-        create_gl_context,
-        destroy_gl_context,
-        make_current,
-        get_drm_fd: std::ptr::null(),
-        write_context_fence: std::ptr::null(),
-        get_server_fd: std::ptr::null(),
-        get_egl_display: std::ptr::null(),
-    };
+    let mut callbacks = callbacks();
     // The renderer refuses a null cookie, although it never reads this value.
     let mut cookie = 0_u8;
     let cookie: *mut c_void = (&raw mut cookie).cast();
@@ -388,4 +449,454 @@ pub fn probe(folder: &Path) -> Result<Probe> {
         unsafe { cleanup(cookie) };
     }
     Ok(found)
+}
+
+/// `struct iovec`, which the renderer's Windows build defines this way.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IoVec {
+    base: *mut c_void,
+    length: usize,
+}
+
+/// `struct virgl_box`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransferBox {
+    /// Left edge.
+    pub x: u32,
+    /// Top edge.
+    pub y: u32,
+    /// Front edge.
+    pub z: u32,
+    /// Width.
+    pub width: u32,
+    /// Height.
+    pub height: u32,
+    /// Depth.
+    pub depth: u32,
+}
+
+/// `struct virgl_renderer_resource_create_args`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceArgs {
+    /// Guest-chosen handle.
+    pub handle: u32,
+    /// Texture target.
+    pub target: u32,
+    /// Pixel format.
+    pub format: u32,
+    /// Usage flags.
+    pub bind: u32,
+    /// Width.
+    pub width: u32,
+    /// Height.
+    pub height: u32,
+    /// Depth.
+    pub depth: u32,
+    /// Array layers.
+    pub array_size: u32,
+    /// Highest mip level.
+    pub last_level: u32,
+    /// Sample count.
+    pub samples: u32,
+    /// Resource flags.
+    pub flags: u32,
+}
+
+/// One copy between a resource's guest memory and the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transfer {
+    /// Resource handle.
+    pub resource: u32,
+    /// Rendering context, or zero.
+    pub context: u32,
+    /// Mip level.
+    pub level: u32,
+    /// Bytes per row, or zero for the default.
+    pub stride: u32,
+    /// Bytes per layer, or zero for the default.
+    pub layer_stride: u32,
+    /// Region.
+    pub region: TransferBox,
+    /// Offset into the guest's memory.
+    pub offset: u64,
+}
+
+type ResourceCreate = unsafe extern "C" fn(*mut ResourceArgs, *mut IoVec, u32) -> c_int;
+type ResourceUnref = unsafe extern "C" fn(u32);
+type AttachIov = unsafe extern "C" fn(c_int, *mut IoVec, c_int) -> c_int;
+type DetachIov = unsafe extern "C" fn(c_int, *mut *mut IoVec, *mut c_int);
+type ContextCreate = unsafe extern "C" fn(u32, u32, *const c_char) -> c_int;
+type ContextDestroy = unsafe extern "C" fn(u32);
+type ContextResource = unsafe extern "C" fn(c_int, c_int);
+type Submit = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
+type TransferRead = unsafe extern "C" fn(
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut TransferBox,
+    u64,
+    *mut IoVec,
+    c_int,
+) -> c_int;
+type TransferWrite = unsafe extern "C" fn(
+    u32,
+    u32,
+    c_int,
+    u32,
+    u32,
+    *mut TransferBox,
+    u64,
+    *mut IoVec,
+    u32,
+) -> c_int;
+type NoArguments = unsafe extern "C" fn();
+type FillCaps = unsafe extern "C" fn(u32, u32, *mut c_void);
+
+/// The renderer's entry points.
+struct Functions {
+    resource_create: ResourceCreate,
+    resource_unref: ResourceUnref,
+    attach_iov: AttachIov,
+    detach_iov: DetachIov,
+    context_create: ContextCreate,
+    context_destroy: ContextDestroy,
+    context_attach: ContextResource,
+    context_detach: ContextResource,
+    submit: Submit,
+    transfer_read: TransferRead,
+    transfer_write: TransferWrite,
+    poll: NoArguments,
+    force_context_zero: NoArguments,
+    get_cap_set: GetCapSet,
+    fill_caps: FillCaps,
+    cleanup: Cleanup,
+}
+
+/// Joins neighbouring guest ranges, which spares the renderer many small
+/// copies, and turns them into host pointers. `None` if any range leaves RAM.
+fn host_ranges(ram: *mut u8, ram_bytes: usize, entries: &[(u64, u32)]) -> Option<Vec<IoVec>> {
+    let mut ranges: Vec<(u64, usize)> = Vec::with_capacity(entries.len());
+    for &(gpa, length) in entries {
+        let length = length as usize;
+        check_range(gpa, length, ram_bytes).ok()?;
+        match ranges.last_mut() {
+            Some((start, held)) if *start + *held as u64 == gpa => *held += length,
+            _ => ranges.push((gpa, length)),
+        }
+    }
+    let to_host = |(gpa, length): (u64, usize)| IoVec {
+        // The offset was proved to lie inside RAM, and wrapping addition
+        // never dereferences anything.
+        base: ram.wrapping_add(gpa as usize).cast(),
+        length,
+    };
+    Some(ranges.into_iter().map(to_host).collect())
+}
+
+/// A running virglrenderer.
+///
+/// The guest's commands are untrusted, and virglrenderer is what checks them.
+/// This type keeps RAX's side of the contract: pointers stay inside guest
+/// RAM, and the renderer stays on the thread that owns its OpenGL context,
+/// which the raw pointers below enforce by making this type `!Send`.
+pub struct Renderer<'vm> {
+    functions: Functions,
+    ram: *mut u8,
+    ram_bytes: usize,
+    /// Lists the renderer holds pointers into until they are detached.
+    backing: HashMap<u32, Vec<IoVec>>,
+    cookie: Box<u8>,
+    _callbacks: Box<Callbacks>,
+    _library: Library,
+    _window: GlWindow,
+    /// Guest RAM must outlive the renderer.
+    _vm: PhantomData<&'vm ()>,
+}
+
+impl Renderer<'_> {
+    /// Starts the renderer from `folder`. `ram` must be valid for
+    /// `ram_bytes` for as long as the returned value exists.
+    pub(crate) fn start(folder: &Path, ram: *mut u8, ram_bytes: usize) -> Result<Self> {
+        let window = GlWindow::new()?;
+        hook_up_contexts(&window)?;
+        // Windows only looks beside a DLL for its dependencies given a full
+        // path. A folder that cannot be resolved then fails to load below.
+        let folder = std::path::absolute(folder).unwrap_or_else(|_| folder.to_owned());
+        let library = Library::load_from(&folder.join("libvirglrenderer-1.dll"))?;
+        // SAFETY: each alias matches the signature in virglrenderer.h, and
+        // `library` is stored beside the pointers.
+        let (functions, init) = unsafe {
+            (
+                Functions {
+                    resource_create: library.symbol(c"virgl_renderer_resource_create")?,
+                    resource_unref: library.symbol(c"virgl_renderer_resource_unref")?,
+                    attach_iov: library.symbol(c"virgl_renderer_resource_attach_iov")?,
+                    detach_iov: library.symbol(c"virgl_renderer_resource_detach_iov")?,
+                    context_create: library.symbol(c"virgl_renderer_context_create")?,
+                    context_destroy: library.symbol(c"virgl_renderer_context_destroy")?,
+                    context_attach: library.symbol(c"virgl_renderer_ctx_attach_resource")?,
+                    context_detach: library.symbol(c"virgl_renderer_ctx_detach_resource")?,
+                    submit: library.symbol(c"virgl_renderer_submit_cmd")?,
+                    transfer_read: library.symbol(c"virgl_renderer_transfer_read_iov")?,
+                    transfer_write: library.symbol(c"virgl_renderer_transfer_write_iov")?,
+                    poll: library.symbol(c"virgl_renderer_poll")?,
+                    force_context_zero: library.symbol(c"virgl_renderer_force_ctx_0")?,
+                    get_cap_set: library.symbol(c"virgl_renderer_get_cap_set")?,
+                    fill_caps: library.symbol(c"virgl_renderer_fill_caps")?,
+                    cleanup: library.symbol(c"virgl_renderer_cleanup")?,
+                },
+                library.symbol::<RendererInit>(c"virgl_renderer_init")?,
+            )
+        };
+        let mut callbacks = Box::new(callbacks());
+        // The renderer refuses a null cookie, although it never reads it.
+        let mut cookie = Box::new(0_u8);
+        // SAFETY: both boxes are stored in the result, and Drop cleans up
+        // before they are released. Flags of zero select caller contexts.
+        let code = unsafe { init((&raw mut *cookie).cast(), 0, &raw mut *callbacks) };
+        if code != 0 {
+            return Err(Error::Hresult {
+                api: "virgl_renderer_init",
+                code,
+            });
+        }
+        Ok(Self {
+            functions,
+            ram,
+            ram_bytes,
+            backing: HashMap::new(),
+            cookie,
+            _callbacks: callbacks,
+            _library: library,
+            _window: window,
+            _vm: PhantomData,
+        })
+    }
+
+    /// The highest version and size of a capability set.
+    pub fn capset_info(&mut self, id: u32) -> (u32, u32) {
+        let (mut version, mut size) = (0, 0);
+        // SAFETY: the renderer is running, and the out pointers are valid.
+        unsafe { (self.functions.get_cap_set)(id, &raw mut version, &raw mut size) };
+        (version, size)
+    }
+
+    /// The contents of a capability set.
+    pub fn capset(&mut self, id: u32, version: u32) -> Vec<u8> {
+        let (_, size) = self.capset_info(id);
+        let mut bytes = vec![0_u8; size as usize];
+        // SAFETY: the buffer is the size the renderer gave for this set.
+        unsafe { (self.functions.fill_caps)(id, version, bytes.as_mut_ptr().cast()) };
+        bytes
+    }
+
+    /// Makes the renderer's own context current. Call before each command.
+    pub fn prepare(&mut self) {
+        // SAFETY: the renderer is running on its own thread.
+        unsafe { (self.functions.force_context_zero)() }
+    }
+
+    /// Lets the renderer finish queued work, such as query results.
+    pub fn poll(&mut self) {
+        // SAFETY: the renderer is running on its own thread.
+        unsafe { (self.functions.poll)() }
+    }
+
+    /// Creates a resource. Returns the renderer's status.
+    pub fn create_resource(&mut self, mut args: ResourceArgs) -> i32 {
+        // SAFETY: `args` is valid for the call, and no pointer list is given.
+        unsafe { (self.functions.resource_create)(&raw mut args, std::ptr::null_mut(), 0) }
+    }
+
+    /// Releases a resource and any memory attached to it.
+    pub fn destroy_resource(&mut self, handle: u32) {
+        self.detach_backing(handle);
+        // SAFETY: unknown handles are ignored by the renderer.
+        unsafe { (self.functions.resource_unref)(handle) };
+    }
+
+    /// Gives a resource its guest memory. `entries` are `(address, length)`,
+    /// and any range outside RAM fails the whole request.
+    pub fn attach_backing(&mut self, handle: u32, entries: &[(u64, u32)]) -> i32 {
+        let Some(mut list) = host_ranges(self.ram, self.ram_bytes, entries) else {
+            return -1;
+        };
+        // SAFETY: every range lies inside guest RAM, which outlives the
+        // renderer, and `list` is kept until it is detached. A Vec's heap
+        // block does not move when the Vec itself moves into the map.
+        let code = unsafe {
+            (self.functions.attach_iov)(handle as c_int, list.as_mut_ptr(), list.len() as c_int)
+        };
+        if code == 0 {
+            self.backing.insert(handle, list);
+        }
+        code
+    }
+
+    /// Takes a resource's guest memory away.
+    pub fn detach_backing(&mut self, handle: u32) {
+        let mut list = std::ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: the out pointers are valid for the call.
+        unsafe { (self.functions.detach_iov)(handle as c_int, &raw mut list, &raw mut count) };
+        self.backing.remove(&handle);
+    }
+
+    /// Creates a rendering context.
+    pub fn create_context(&mut self, id: u32, name: &[u8]) -> i32 {
+        // SAFETY: the renderer reads exactly `name.len()` bytes.
+        unsafe { (self.functions.context_create)(id, name.len() as u32, name.as_ptr().cast()) }
+    }
+
+    /// Destroys a rendering context.
+    pub fn destroy_context(&mut self, id: u32) {
+        // SAFETY: unknown contexts are ignored by the renderer.
+        unsafe { (self.functions.context_destroy)(id) };
+    }
+
+    /// Lets a context use a resource.
+    pub fn attach_to_context(&mut self, context: u32, resource: u32) {
+        // SAFETY: unknown ids are ignored by the renderer.
+        unsafe { (self.functions.context_attach)(context as c_int, resource as c_int) };
+    }
+
+    /// Stops a context using a resource.
+    pub fn detach_from_context(&mut self, context: u32, resource: u32) {
+        // SAFETY: unknown ids are ignored by the renderer.
+        unsafe { (self.functions.context_detach)(context as c_int, resource as c_int) };
+    }
+
+    /// Runs a guest command buffer.
+    pub fn submit(&mut self, context: u32, commands: &mut [u32]) -> i32 {
+        // SAFETY: the renderer reads exactly `commands.len()` words.
+        unsafe {
+            (self.functions.submit)(
+                commands.as_mut_ptr().cast(),
+                context as c_int,
+                commands.len() as c_int,
+            )
+        }
+    }
+
+    /// Copies from a resource's guest memory to the host.
+    pub fn transfer_to_host(&mut self, mut transfer: Transfer) -> i32 {
+        // SAFETY: a null list selects the backing attached earlier, whose
+        // bounds the renderer checks against the box.
+        unsafe {
+            (self.functions.transfer_write)(
+                transfer.resource,
+                transfer.context,
+                transfer.level as c_int,
+                transfer.stride,
+                transfer.layer_stride,
+                &raw mut transfer.region,
+                transfer.offset,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    }
+
+    /// Copies from the host to a resource's guest memory.
+    pub fn transfer_from_host(&mut self, mut transfer: Transfer) -> i32 {
+        // SAFETY: as for `transfer_to_host`.
+        unsafe {
+            (self.functions.transfer_read)(
+                transfer.resource,
+                transfer.context,
+                transfer.level,
+                transfer.stride,
+                transfer.layer_stride,
+                &raw mut transfer.region,
+                transfer.offset,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+    }
+
+    /// Reads a resource's top level into `pixels`, four bytes each.
+    pub fn read_pixels(
+        &mut self,
+        resource: u32,
+        width: u32,
+        height: u32,
+        pixels: &mut [u8],
+    ) -> i32 {
+        let stride = width.saturating_mul(4);
+        let needed = (stride as usize).saturating_mul(height as usize);
+        if needed > pixels.len() {
+            return -1;
+        }
+        let mut list = IoVec {
+            base: pixels.as_mut_ptr().cast(),
+            length: needed,
+        };
+        let mut region = TransferBox {
+            width,
+            height,
+            depth: 1,
+            ..TransferBox::default()
+        };
+        // SAFETY: `list` covers `needed` writable bytes for the whole call,
+        // and the renderer holds no pointer to it afterwards.
+        unsafe {
+            (self.functions.transfer_read)(
+                resource,
+                0,
+                0,
+                stride,
+                0,
+                &raw mut region,
+                0,
+                &raw mut list,
+                1,
+            )
+        }
+    }
+}
+
+impl Drop for Renderer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the renderer started with this cookie, and everything it
+        // holds pointers to is released only after this call.
+        unsafe { (self.functions.cleanup)((&raw mut *self.cookie).cast()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RAM: usize = 0x1_0000;
+
+    fn ranges(entries: &[(u64, u32)]) -> Option<Vec<(usize, usize)>> {
+        let list = host_ranges(std::ptr::null_mut(), RAM, entries)?;
+        Some(list.iter().map(|i| (i.base as usize, i.length)).collect())
+    }
+
+    #[test]
+    fn neighbouring_ranges_are_joined() {
+        assert_eq!(
+            ranges(&[(0x1000, 0x1000), (0x2000, 0x1000), (0x8000, 0x10)]),
+            Some(vec![(0x1000, 0x2000), (0x8000, 0x10)])
+        );
+    }
+
+    #[test]
+    fn ranges_outside_ram_are_refused() {
+        assert_eq!(ranges(&[(RAM as u64 - 1, 2)]), None);
+        assert_eq!(ranges(&[(u64::MAX, 2)]), None);
+        assert_eq!(ranges(&[(0, 1), (RAM as u64, 1)]), None);
+    }
+
+    #[test]
+    fn a_range_may_end_exactly_at_the_top_of_ram() {
+        assert_eq!(ranges(&[(RAM as u64 - 1, 1)]), Some(vec![(RAM - 1, 1)]));
+    }
 }

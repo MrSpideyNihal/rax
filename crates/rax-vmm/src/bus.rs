@@ -96,6 +96,7 @@ impl Bus {
         disks: Vec<VirtioBlk>,
         network: Option<VirtioNet>,
         touch: Option<VirtioInput>,
+        gpu: bool,
     ) -> Self {
         Self {
             pic: Pic::default(),
@@ -105,7 +106,7 @@ impl Bus {
             wall_clock,
             serial: Serial::new(console),
             ps2: Ps2::default(),
-            pci: Pci::new(disks.len(), network.is_some(), touch.is_some()),
+            pci: Pci::new(disks.len(), network.is_some(), touch.is_some(), gpu),
             disks,
             network,
             touch,
@@ -309,7 +310,19 @@ impl Bus {
     /// Whether a memory address belongs to a device.
     #[must_use]
     pub fn owns_memory(&self, gpa: u64) -> bool {
-        self.pci.input_offset(gpa).is_some()
+        self.pci.input_offset(gpa).is_some() || self.pci.gpu_offset(gpa).is_some()
+    }
+
+    /// Finds the GPU register a memory address belongs to. The GPU itself
+    /// lives on the vCPU thread, because OpenGL contexts cannot move.
+    #[must_use]
+    pub fn gpu_offset(&self, gpa: u64) -> Option<u64> {
+        self.pci.gpu_offset(gpa)
+    }
+
+    /// Raises the interrupt line the virtio devices share.
+    pub fn raise_virtio(&mut self) {
+        self.pic.raise(VIRTIO_IRQ);
     }
 
     /// Handles a device memory load.
@@ -426,7 +439,14 @@ mod tests {
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
         (
-            Bus::new(Box::new(capture.clone()), || 0, Vec::new(), None, None),
+            Bus::new(
+                Box::new(capture.clone()),
+                || 0,
+                Vec::new(),
+                None,
+                None,
+                false,
+            ),
             capture,
         )
     }

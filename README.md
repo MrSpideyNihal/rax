@@ -5,7 +5,7 @@
 
 **A research project to build the lightest practical Android gaming runtime for Windows, in Rust.**
 
-> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. It has internet. Rendering is software only, with no GPU acceleration, so no game runs yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
+> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. It has internet, and it draws on the host GPU through API forwarding. No game has been tested yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
 
 ![The RAX launcher](docs/images/launcher.png)
 
@@ -15,7 +15,7 @@ Run `rax.exe` with no arguments to open the launcher. Everything stays in one fo
 
 F12 switches to game controls, where keys and the mouse become fingers on a virtual multi-touch screen. Android has internet through RAX's own small router, with no driver, no administrator rights, and no setup.
 
-**Google Play is not included.** It is licensed by Google, so RAX cannot ship it.
+**Google Play is not part of RAX, and it has no licence to ship it.** The Android image `scripts/fetch-android.ps1` currently downloads turned out to contain Google's apps, which conflicts with [ADR-0005](docs/ADR/0005-google-play-policy.md). Until that image is replaced, no RAX download may include it.
 
 | Command | What it does |
 |---|---|
@@ -28,17 +28,17 @@ Results on the target laptop (Ryzen 7 7445HS, Windows 11 Home, VBS on):
 - A guest exit costs a **median of 3.0 µs**, with a worst case of 340 µs.
 - A tiny Linux 6.18 guest reaches user space in **774 ms on average**, over 10 boots.
 
-Android 9 boots in 54 s on RAX, using 2.0 GB of host RAM and 7.3% of one core at idle. That is not comparable with a full modern Android, because it has no Google Play services and no GPU path. The baseline to beat is Android Studio's emulator running Android 14 with Google Play: **38 s** to boot, **3.6 GB** of host RAM, and **56% of one core** at idle. [Raw data, method and limits](docs/BENCHMARKS.md).
+Android 9 boots in 33 s on RAX with the GPU, using 2.2 GB of host RAM and 2.3% of one core at idle. That is an old Android on one vCPU, so it is not comparable with a full modern Android. The baseline to beat is Android Studio's emulator running Android 14 with Google Play: **38 s** to boot, **3.6 GB** of host RAM, and **56% of one core** at idle. [Raw data, method and limits](docs/BENCHMARKS.md).
 
 ## What the research found
 
 Read the [feasibility report](docs/FEASIBILITY.md). The short version:
 
-- **The runtime looks buildable.** WHP works, and exit cost is not the bottleneck. Android and GPU forwarding are the hard parts still ahead.
+- **The runtime looks buildable.** WHP works, and exit cost is not the bottleneck. Game speed through GPU forwarding is the hard part still ahead.
 - **Google Play is the real obstacle.** It needs a licence from Google, and engineering cannot replace that. RAX will not bundle, spoof or bypass it ([ADR-0005](docs/ADR/0005-google-play-policy.md)).
 - **ARM translation may be avoidable for Minecraft,** which lists an x86_64 Android build, though that is untested here. **BGMI is listed as ARM-only, so it is blocked** until a legal translation path exists.
 - **Free Fire and BGMI are goals, not promises.** RAX has no macros and will not hide from anti-cheat ([ADR-0007](docs/ADR/0007-game-goals-and-input.md)).
-- **There is no GPU passthrough.** The plan is API forwarding with gfxstream, and we will call it that.
+- **There is no GPU passthrough.** Android's OpenGL ES commands are forwarded to the host through virglrenderer, and we call it API forwarding.
 
 ## Quick start
 

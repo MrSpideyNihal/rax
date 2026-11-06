@@ -38,9 +38,9 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 | Installing an APK by console | **Tested**: `pm install` returned `Success` |
 | Dragging an APK onto the window | Built, **not tested end to end** |
 | Apps and data surviving a shutdown | **Tested**: both survived a reboot on `data.img` |
-| Software rendering | **Tested**, for booting only. Never a gaming path |
+| Software rendering | **Tested**, used only when the `gpu` folder is missing. Never a gaming path |
 | Host renderer on the RTX 3050 | **Tested**: virglrenderer starts on NVIDIA OpenGL 4.6 |
-| Hardware OpenGL ES in Android | Not working yet: the virtio-gpu device is not built |
+| Hardware OpenGL ES in Android | **Tested**: Android 9 draws through virgl on the RTX 3050, OpenGL ES 3.1. No game tested |
 | Hardware Vulkan | Not started |
 
 ## Free Fire and BGMI
@@ -64,6 +64,6 @@ Your account carries the risk of following or breaking each game's rules. RAX do
 | x86_64 Android build | Listed version code, conflicting community report | [FEASIBILITY §6](FEASIBILITY.md#6-android-arm-compatibility-strategy) |
 | Graphics API | OpenGL ES (RenderDragon) | Minecraft Wiki |
 | Mouse and keyboard on Android | Unverified | |
-| Installation from Google Play | **Not available.** RAX has no licensed Play environment | [ADR-0005](ADR/0005-google-play-policy.md) |
+| Installation from Google Play | **Not supported.** RAX has no licensed Play environment. The current test image contains Google's apps, which must be fixed | [ADR-0005](ADR/0005-google-play-policy.md) |
 
 Owning Minecraft on Android does not provide a Windows Bedrock licence, and RAX does not change that.

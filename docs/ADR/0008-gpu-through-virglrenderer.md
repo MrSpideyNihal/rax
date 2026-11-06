@@ -4,7 +4,7 @@ Status: Accepted, 2026-11-06. Replaces the gfxstream plan in [ADR-0003](0003-gra
 
 ## Problem
 
-Games need hardware rendering. ADR-0003 chose gfxstream, but its guest libraries would have to be built into Android, and building Android needs a Linux machine with far more disk than this project has. RAX's own VMM also rules out reusing an emulator's graphics stack as it stands.
+Games need hardware rendering. ADR-0003 chose gfxstream, but its guest libraries would have to be built into Android, which means a full Android build on Linux, and this PC has neither Linux nor that build set up. RAX's own VMM also rules out reusing an emulator's graphics stack as it stands.
 
 ## What was found
 
@@ -27,7 +27,12 @@ On hybrid laptops the executable exports `NvOptimusEnablement` and `AmdPowerXpre
 - **Speed is unknown.** virgl translates guest OpenGL to host OpenGL, with commands going through the VM. It may be too slow for demanding games, and nothing here measures that.
 - **The guest speaks OpenGL ES through virgl.** Android 9's Mesa version limits which features games get. Vulkan is not part of this path.
 - **It is native third-party code** running inside RAX with the user's permissions, and it parses commands from the guest. Sandboxing it is a requirement before wide release.
-- The `virtio-gpu` device itself is not built yet.
+- **Frames are read back.** The window gets each frame through a synchronous copy from the GPU, at most about 60 times a second, which costs time that showing the texture directly would not.
+- **Rendering stops the guest.** The only vCPU waits while the renderer works on the same thread. A separate render thread is the obvious next step once a game shows the cost.
+
+## Result
+
+Built on 2026-11-06. Android 9 boots with `GLES: Red Hat, virgl, OpenGL ES 3.1 Mesa 19.3.5`, and draws in the live window. All OpenGL contexts must share one group, or guest contexts cannot see resources created in the renderer's first context. Setting `RAX_GL_DEBUG` makes the driver print its errors, which is how that was found.
 
 ## Consequences
 

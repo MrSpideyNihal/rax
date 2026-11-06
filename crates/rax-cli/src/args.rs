@@ -68,6 +68,8 @@ pub struct VmRun {
     pub cmdline: Option<String>,
     /// Screen size, as `(width, height)`.
     pub framebuffer: Option<(u16, u16)>,
+    /// Folder holding virglrenderer, which turns on the GPU.
+    pub gpu: Option<String>,
     /// File to save the screen to.
     pub screenshot: Option<String>,
     /// File of timed input for repeatable tests.
@@ -135,6 +137,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut disks = Vec::new();
     let mut cmdline = None;
     let mut framebuffer = None;
+    let mut gpu = None;
     let mut screenshot = None;
     let mut input_script = None;
     let mut network = false;
@@ -161,6 +164,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--disk" => disks.push((*value).to_owned()),
             "--cmdline" => cmdline = Some((*value).to_owned()),
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
+            "--gpu" => gpu = Some((*value).to_owned()),
             "--screenshot" => screenshot = Some((*value).to_owned()),
             "--input-script" => input_script = Some((*value).to_owned()),
             "--touch-script" => touch_script = Some((*value).to_owned()),
@@ -177,6 +181,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         disks,
         cmdline,
         framebuffer,
+        gpu,
         screenshot,
         input_script,
         network,
@@ -286,6 +291,7 @@ mod tests {
                 disks: Vec::new(),
                 cmdline: None,
                 framebuffer: None,
+                gpu: None,
                 screenshot: None,
                 input_script: None,
                 network: false,

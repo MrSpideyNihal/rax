@@ -47,7 +47,23 @@ const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, F12 g
 
 const ANDROID_CMDLINE: &str = "console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
     tsc=reliable androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
-    androidboot.selinux=permissive nomodeset HWACCEL=0 VIRT_WIFI=0 SRC= DEBUG=";
+    androidboot.selinux=permissive VIRT_WIFI=0 SRC= DEBUG=";
+/// Keeps Android on the plain framebuffer.
+const SOFTWARE_GRAPHICS: &str = "nomodeset HWACCEL=0";
+/// The folder `scripts/fetch-gpu.ps1` fills.
+const GPU_FOLDER: &str = "gpu";
+const GPU_LIBRARY: &str = "libvirglrenderer-1.dll";
+
+fn android_cmdline(data_arg: &str, gpu: bool) -> String {
+    let graphics = if gpu { "" } else { SOFTWARE_GRAPHICS };
+    format!("{ANDROID_CMDLINE} {graphics} DATA={data_arg}")
+}
+
+/// The renderer's folder, if this copy of RAX has one.
+fn gpu_folder(root: &Path) -> Option<PathBuf> {
+    let folder = root.join(GPU_FOLDER);
+    folder.join(GPU_LIBRARY).is_file().then_some(folder)
+}
 
 fn has_android(root: &Path) -> bool {
     [KERNEL, INITRD, SYSTEM]
@@ -153,8 +169,9 @@ fn android_config(
         shell: false,
         disks,
         init_script: None,
-        own_init_cmdline: Some(format!("{ANDROID_CMDLINE} DATA={data_arg}")),
+        own_init_cmdline: Some(android_cmdline(data_arg, false)),
         framebuffer: None,
+        gpu: None,
         screenshot: None,
         network: None,
         touchscreen: false,
@@ -305,6 +322,8 @@ fn begin_install(path: &Path, inbox: &Path, display: &Display) -> Result<Install
 #[derive(Default)]
 struct InputState {
     buttons: u8,
+    /// Keys Android believes are down, as `(scancode, extended)`.
+    keys: Vec<(u8, bool)>,
 }
 
 impl InputState {
@@ -322,9 +341,36 @@ impl InputState {
         GuestInput::MouseButtons(self.buttons)
     }
 
-    /// Lifts held buttons, so nothing stays stuck after losing the mouse.
-    fn release(&mut self) -> Option<GuestInput> {
-        (std::mem::take(&mut self.buttons) != 0).then_some(GuestInput::MouseButtons(0))
+    fn key(&mut self, scancode: u8, extended: bool, down: bool) -> GuestInput {
+        let key = (scancode, extended);
+        self.keys.retain(|&held| held != key);
+        if down {
+            self.keys.push(key);
+        }
+        GuestInput::Key {
+            scancode,
+            extended,
+            down,
+        }
+    }
+
+    /// Lifts everything held. Windows sends no key-up to a window that lost
+    /// focus, so without this the Alt of an Alt+Tab stays down in Android,
+    /// and every letter typed after coming back becomes an Alt character.
+    fn release(&mut self) -> Vec<GuestInput> {
+        let keys = std::mem::take(&mut self.keys);
+        let mut lifted: Vec<GuestInput> = keys
+            .into_iter()
+            .map(|(scancode, extended)| GuestInput::Key {
+                scancode,
+                extended,
+                down: false,
+            })
+            .collect();
+        if std::mem::take(&mut self.buttons) != 0 {
+            lifted.push(GuestInput::MouseButtons(0));
+        }
+        lifted
     }
 }
 
@@ -339,6 +385,8 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     let mut config = android_config(root, "vdb", disks)?;
     config.ram_mib = MEMORY_CHOICES_MIB[settings.memory];
     config.framebuffer = Some(screen);
+    config.gpu = gpu_folder(root);
+    config.own_init_cmdline = Some(android_cmdline("vdb", config.gpu.is_some()));
     config.network = Some(Network::start());
     config.touchscreen = true;
     config.display = Some(display.clone());
@@ -429,11 +477,7 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                     extended,
                     down,
                     ..
-                } => queued.push(GuestInput::Key {
-                    scancode,
-                    extended,
-                    down,
-                }),
+                } => queued.push(input.key(scancode, extended, down)),
                 _ => {}
             }
         }
@@ -500,8 +544,8 @@ mod tests {
     fn releasing_lifts_held_buttons_once() {
         let mut input = InputState::default();
         input.button(Button::Left, true);
-        assert_eq!(input.release(), Some(GuestInput::MouseButtons(0)));
-        assert_eq!(input.release(), None);
+        assert_eq!(input.release(), [GuestInput::MouseButtons(0)]);
+        assert_eq!(input.release(), []);
     }
 
     /// A press on a key bound at (0.5, 0.5), through the path the window uses.
@@ -584,6 +628,72 @@ mod tests {
         // Android connects wired networks by itself. The Android-x86 default
         // wraps the card as a Wi-Fi network that someone would have to join.
         assert!(ANDROID_CMDLINE.contains("VIRT_WIFI=0"));
+    }
+
+    const ALT: u8 = 0x38;
+
+    fn key_up(scancode: u8, extended: bool) -> GuestInput {
+        GuestInput::Key {
+            scancode,
+            extended,
+            down: false,
+        }
+    }
+
+    #[test]
+    fn alt_held_while_focus_is_lost_is_lifted() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        assert_eq!(input.release(), [key_up(ALT, false)]);
+        assert_eq!(input.release(), [], "lifted only once");
+    }
+
+    #[test]
+    fn a_key_already_released_is_not_lifted_again() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.key(ALT, false, false);
+        assert_eq!(input.release(), []);
+    }
+
+    #[test]
+    fn left_and_right_alt_are_different_keys() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.key(ALT, true, true);
+        input.key(ALT, false, false);
+        assert_eq!(input.release(), [key_up(ALT, true)]);
+    }
+
+    #[test]
+    fn auto_repeat_cannot_grow_the_held_list() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.key(ALT, false, true);
+        assert_eq!(input.release().len(), 1);
+    }
+
+    #[test]
+    fn keys_and_buttons_are_lifted_together() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.button(Button::Left, true);
+        assert_eq!(
+            input.release(),
+            [key_up(ALT, false), GuestInput::MouseButtons(0)]
+        );
+    }
+
+    #[test]
+    fn only_the_gpu_needs_kernel_mode_setting() {
+        assert!(android_cmdline("vdb", false).contains("nomodeset HWACCEL=0"));
+        let gpu = android_cmdline("vdb", true);
+        assert!(!gpu.contains("nomodeset") && !gpu.contains("HWACCEL"));
+    }
+
+    #[test]
+    fn a_folder_without_the_renderer_stays_on_software() {
+        assert_eq!(gpu_folder(Path::new("no-such-folder")), None);
     }
 
     #[test]

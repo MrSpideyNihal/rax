@@ -12,16 +12,19 @@ param(
     [Parameter(Mandatory)][string]$Session,
     [ValidateRange(512, 8192)][int]$RamMib = 2048,
     [ValidateRange(0, 600)][int]$SettleSecs = 300,
-    [ValidateRange(1, 300)][int]$IdleSampleSecs = 60
+    [ValidateRange(1, 300)][int]$IdleSampleSecs = 60,
+    # Folder holding virglrenderer. Boots on the virtio GPU when given.
+    [string]$Gpu
 )
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path -Parent $PSScriptRoot)
 New-Item -ItemType Directory -Force -Path $Session | Out-Null
 
+$graphics = if ($Gpu) { '' } else { 'nomodeset HWACCEL=0 ' }
 $cmdline = 'console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 i8042.noaux ' +
     'tsc=reliable tsc_early_khz=3194043 androidboot.hardware=android_x86_64 ' +
-    'androidboot.console=ttyS0 androidboot.selinux=permissive nomodeset HWACCEL=0 ' +
+    "androidboot.console=ttyS0 androidboot.selinux=permissive $graphics" +
     'SRC= DATA= DEBUG='
 $quoted = '"' + $cmdline + '"'
 $arguments = @(
@@ -30,6 +33,7 @@ $arguments = @(
     '--framebuffer', '1280x720', '--cmdline', $quoted,
     '--timeout-secs', ($SettleSecs + $IdleSampleSecs + 90)
 )
+if ($Gpu) { $arguments += '--gpu', $Gpu }
 
 $process = Start-Process ./target/release/rax.exe -ArgumentList $arguments -NoNewWindow -PassThru `
     -RedirectStandardOutput 'guest/measure-android.log' `
@@ -48,6 +52,7 @@ $wall = $clock.Elapsed.TotalSeconds
     schema_version      = 1
     benchmark           = 'android-rax-idle'
     ram_mib             = $RamMib
+    gpu                 = [bool]$Gpu
     settle_secs         = 60 + $SettleSecs
     sample_secs         = [math]::Round($wall, 2)
     percent_of_one_core = [math]::Round(100 * $cpu / $wall, 2)

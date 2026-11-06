@@ -331,6 +331,14 @@ impl GuestRegion {
     }
 }
 
+impl GuestRegion {
+    /// The region's first byte and its size, for code that keeps pointers
+    /// into guest memory.
+    pub(crate) fn raw_parts(&self) -> (*mut u8, usize) {
+        (self.base.as_ptr().cast(), self.size)
+    }
+}
+
 impl Drop for GuestRegion {
     fn drop(&mut self) {
         // SAFETY: `base` came from VirtualAlloc and size 0 with MEM_RELEASE

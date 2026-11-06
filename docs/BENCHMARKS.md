@@ -184,7 +184,7 @@ The screenshot was saved by `--screenshot` from guest memory.
 |---|---|
 | Raw data | [`benchmarks/results/2026-11-06-android-rax`](../benchmarks/results/2026-11-06-android-rax) |
 | Commands | `sh scripts/android-boot-time.sh SESSION 3 2048`, then `./scripts/measure-android-rax.ps1 -Session SESSION` |
-| Guest | Android-x86 9.0-r2, 2 GB RAM, 1 vCPU, 1280 x 720 framebuffer, software rendering, no Google apps |
+| Guest | Android-x86 9.0-r2, 2 GB RAM, 1 vCPU, 1280 x 720 framebuffer, software rendering. The image contains Google's apps, which was not known when this was measured |
 | Host | Same laptop, on mains, about 6.5 GB of RAM available |
 
 | Measurement | Result |
@@ -195,23 +195,40 @@ The screenshot was saved by `--screenshot` from guest memory.
 | Host private memory, idle | 2066 MiB, for 2048 MiB of guest RAM |
 | CPU, settled over 5 minutes | 7.26% of one core. One 60 s sample |
 
+### Android 9 with the GPU
+
+| | |
+|---|---|
+| Raw data | [`benchmarks/results/2026-11-06-android-rax-gpu`](../benchmarks/results/2026-11-06-android-rax-gpu) |
+| Commands | `GPU=gpu sh scripts/android-boot-time.sh SESSION 3 2048`, then `./scripts/measure-android-rax.ps1 -Session SESSION -Gpu gpu -SettleSecs 120` |
+| Guest | As above, on the virtio GPU with virglrenderer on the RTX 3050 |
+
+| Measurement | Software | GPU |
+|---|---|---|
+| Boot until `sys.boot_completed` | 52, 53, 56 s | 32, 33, 33 s |
+| Host working set, idle | 2056 MiB | 2220 MiB |
+| Host private memory, idle | 2066 MiB | 2399 MiB |
+| CPU, settled | 7.26% of one core | 2.29% of one core |
+
+Each idle figure is one 60 s sample, and the GPU one settled for 3 minutes where the software one settled for 6. Host GPU memory is not included. None of this is a game result: **frame rate has not been measured.**
+
 ### RAX beside the Android Studio emulator
 
 | | RAX | Android Studio emulator |
 |---|---|---|
 | Android version | 9, from 2020 | 14 |
-| Google Play services | No | Yes |
+| Google Play services | Present in the image | Yes |
 | vCPUs | 1 | 4 |
 | Guest RAM | 2 GB | 1.5 GB |
 | Boot | 54 s | 38 s |
 | Host RAM, idle | 2.0 GB | 3.6 GB |
 | CPU, settled | 7.3% of one core | 56% of one core |
 
-**This is not a fair race, and it does not show that RAX is lighter.** Android 9 without Google Play services does much less than Android 14 with them, and RAX has no GPU path yet. Adding those will raise RAX's numbers. Neither column involves a game.
+The RAX column is the software run. **This is not a fair race, and it does not show that RAX is lighter.** Android 9 does much less than Android 14. Neither column involves a game.
 
 What it does show:
 
-- RAX's own overhead is small: about 18 MiB of private memory above guest RAM, though no GPU forwarding is included.
+- RAX's own overhead is small: about 18 MiB of private memory above guest RAM without GPU forwarding, and about 350 MiB with it.
 - RAX boots slower, using one vCPU. That result is against RAX, and more vCPUs should help.
 - The guest's RAM is all touched by the time it is idle, so guest size sets the host cost. Testing smaller guests and returning free memory are the obvious next steps.
 

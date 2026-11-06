@@ -4,7 +4,9 @@
 //! hypervisor is exposed here as a small safe interface.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
+use crate::virgl::Renderer;
 use crate::whp::{
     Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, map_guest_memory, map_guest_ram,
     map_read_only, read_exit,
@@ -62,6 +64,13 @@ impl<'a> Vm<'a> {
     /// Fills `buffer` from guest RAM at `gpa`.
     pub fn read_ram(&self, gpa: u64, buffer: &mut [u8]) -> Result<()> {
         self.ram.read_at(gpa, buffer)
+    }
+
+    /// Starts the GPU renderer from `folder`. It may only use guest RAM while
+    /// the vCPU is stopped, and must stay on this thread.
+    pub fn start_renderer(&self, folder: &Path) -> Result<Renderer<'_>> {
+        let (ram, size) = self.ram.raw_parts();
+        Renderer::start(folder, ram, size)
     }
 
     /// Makes reads of the page holding `gpa` return all ones, as reads of an

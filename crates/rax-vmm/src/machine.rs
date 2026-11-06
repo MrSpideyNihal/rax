@@ -9,6 +9,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rax_host::virgl::Renderer;
 use rax_host::vm::{self, Kicker, Vm};
 use rax_host::whp::{Api, ExitInfo, VmExit};
 use rax_input::Touch;
@@ -24,6 +25,7 @@ use crate::mmio;
 use crate::ps2::GuestInput;
 use crate::serial::Sink;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
+use crate::virtio_gpu::{self, GpuStats, Scanout, VirtioGpu};
 use crate::virtio_input::VirtioInput;
 use crate::virtio_net::VirtioNet;
 
@@ -88,6 +90,9 @@ pub struct Config {
     pub own_init_cmdline: Option<String>,
     /// Gives the guest a screen of this size.
     pub framebuffer: Option<Framebuffer>,
+    /// Folder holding virglrenderer. The screen then comes from a virtio GPU
+    /// drawing on the host's graphics card.
+    pub gpu: Option<PathBuf>,
     /// Saves the screen to this BMP file when the guest stops.
     pub screenshot: Option<PathBuf>,
     /// Gives the guest a network card, with internet through this network.
@@ -171,6 +176,8 @@ pub struct Report {
     pub io: IoStats,
     /// Busiest ports with no device, as `(port, accesses)`.
     pub unclaimed_ports: Vec<(u16, u64)>,
+    /// GPU activity, if there is a GPU.
+    pub gpu: Option<GpuStats>,
 }
 
 struct Finished {
@@ -240,6 +247,8 @@ struct Shared {
     stop: AtomicBool,
     started: Instant,
     display: Option<Display>,
+    /// Rows in the display's frame.
+    screen_height: usize,
     input_script: Vec<(Duration, GuestInput)>,
     touch_script: Vec<(Duration, Touch)>,
     /// Set when touches are waiting to reach guest memory.
@@ -389,10 +398,72 @@ impl GuestMemory for RamView<'_, '_> {
     }
 }
 
+/// The GPU and everything tied to the thread that owns its OpenGL context.
+struct Gpu<'vm> {
+    device: VirtioGpu,
+    renderer: Renderer<'vm>,
+    pixels: Vec<u8>,
+}
+
+impl Gpu<'_> {
+    /// Reads what is on screen into `pixels`, as BGRX.
+    fn read_screen(&mut self) -> Option<Scanout> {
+        let screen = self.device.scanout()?;
+        let bytes = screen.width as usize * screen.height as usize * 4;
+        self.pixels.resize(bytes, 0);
+        self.renderer.prepare();
+        let code = self.renderer.read_pixels(
+            screen.resource,
+            screen.width,
+            screen.height,
+            &mut self.pixels,
+        );
+        if code != 0 {
+            return None;
+        }
+        if screen.swap_red_blue {
+            virtio_gpu::swap_red_blue(&mut self.pixels);
+        }
+        Some(screen)
+    }
+}
+
+/// The part of a register a store of `size` bytes writes.
+fn stored_register(register: u64, size: u8) -> u32 {
+    match size {
+        1 => register as u32 & 0xff,
+        2 => register as u32 & 0xffff,
+        _ => register as u32,
+    }
+}
+
+/// Performs a guest store to GPU memory. The device lock is not held, so the
+/// timer keeps running during a long draw.
+fn gpu_store(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    gpu: &mut Gpu<'_>,
+    offset: u64,
+    value: u32,
+) -> Result<(), Box<dyn Error>> {
+    if gpu.device.write(offset, value) {
+        gpu.device.service(&RamView(vm), &mut gpu.renderer);
+        if gpu.device.take_irq() {
+            shared
+                .bus
+                .lock()
+                .map_err(|_| "device lock poisoned")?
+                .raise_virtio();
+        }
+    }
+    Ok(())
+}
+
 /// Performs a guest access to device memory.
 fn device_memory(
     vm: &Vm<'_>,
     shared: &Shared,
+    gpu: &mut Option<Gpu<'_>>,
     info: &ExitInfo,
     gpa: u64,
     bytes: &[u8],
@@ -400,17 +471,32 @@ fn device_memory(
     let access = mmio::decode(bytes)
         .ok_or_else(|| format!("cannot decode device access {bytes:02x?} at {gpa:#x}"))?;
     let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+    if let (Some(offset), Some(gpu)) = (bus.gpu_offset(gpa), gpu.as_mut()) {
+        drop(bus);
+        if access.write {
+            let value = match access.immediate {
+                Some(value) => value,
+                None => stored_register(vm.general_register(access.register)?, access.size),
+            };
+            gpu_store(vm, shared, gpu, offset, value)?;
+            vm.advance(info, access.length)?;
+        } else {
+            let value = gpu.device.read(offset, access.size);
+            vm.finish_load(
+                info,
+                access.register,
+                access.size,
+                value,
+                access.zero_extend,
+                access.length,
+            )?;
+        }
+        return Ok(());
+    }
     if access.write {
         let value = match access.immediate {
             Some(value) => value,
-            None => {
-                let register = vm.general_register(access.register)? as u32;
-                match access.size {
-                    1 => register & 0xff,
-                    2 => register & 0xffff,
-                    _ => register,
-                }
-            }
+            None => stored_register(vm.general_register(access.register)?, access.size),
         };
         bus.memory_write(gpa, value);
         bus.service_devices(&RamView(vm));
@@ -451,7 +537,12 @@ fn delivery(pending: Option<u8>, interruptible: bool) -> Delivery {
     }
 }
 
-fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished, Box<dyn Error>> {
+fn vcpu_loop(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    gpu: &mut Option<Gpu<'_>>,
+    deadline: Instant,
+) -> Result<Finished, Box<dyn Error>> {
     let mut exits = 0_u64;
     let mut interrupts = 0_u64;
     let mut floating_pages = 0_u64;
@@ -459,6 +550,13 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
     let mut last_frame = Instant::now();
     let mut interruptible = false;
     loop {
+        let frame_due = last_frame.elapsed() >= FRAME_INTERVAL;
+        if frame_due {
+            last_frame = Instant::now();
+            if let Some(gpu) = gpu.as_mut() {
+                gpu.renderer.poll();
+            }
+        }
         if let Some(display) = &shared.display {
             if display.stop.load(Ordering::Relaxed) {
                 return Ok(Finished {
@@ -469,11 +567,27 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                     window_exits,
                 });
             }
-            if last_frame.elapsed() >= FRAME_INTERVAL {
-                last_frame = Instant::now();
-                if let Ok(mut frame) = display.frame.try_lock() {
-                    vm.read_framebuffer(&mut frame)?;
+            match gpu.as_mut() {
+                Some(gpu) if frame_due => {
+                    if gpu.device.take_frame_waiting()
+                        && let Some(screen) = gpu.read_screen()
+                        && let Ok(mut frame) = display.frame.lock()
+                    {
+                        let width = frame.len() / 4 / shared.screen_height.max(1);
+                        virtio_gpu::copy_cropped(
+                            &gpu.pixels,
+                            screen.width,
+                            &mut frame,
+                            width as u32,
+                        );
+                    }
                 }
+                None if frame_due => {
+                    if let Ok(mut frame) = display.frame.try_lock() {
+                        vm.read_framebuffer(&mut frame)?;
+                    }
+                }
+                _ => {}
             }
         }
         if Instant::now() >= deadline {
@@ -562,7 +676,7 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                 .owns_memory(gpa) =>
             {
                 let bytes = &instruction[..usize::from(instruction_bytes)];
-                device_memory(vm, shared, &info, gpa, bytes)?;
+                device_memory(vm, shared, gpu, &info, gpa, bytes)?;
             }
             VmExit::Mmio {
                 gpa, write: false, ..
@@ -647,17 +761,15 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     };
 
     let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
-    if let Some(screen) = config.framebuffer {
+    // With a GPU, the guest finds its screen there and not in the boot data.
+    let vesa_screen = config.framebuffer.filter(|_| config.gpu.is_none());
+    if let Some(screen) = vesa_screen {
         vm.add_framebuffer(u64::from(FRAMEBUFFER_GPA), screen.size_bytes())?;
     }
     vm.write_ram(kernel.load_address(), kernel.payload())?;
     vm.write_ram(initrd_gpa, &initrd)?;
     vm.write_ram(CMDLINE_GPA, &boot::cmdline_bytes(&cmdline)?)?;
-    let params = kernel.boot_params(
-        ram_bytes,
-        Some((initrd_gpa, initrd.len())),
-        config.framebuffer,
-    )?;
+    let params = kernel.boot_params(ram_bytes, Some((initrd_gpa, initrd.len())), vesa_screen)?;
     vm.write_ram(BOOT_PARAMS_GPA, &params)?;
     let gdt = boot::gdt_bytes();
     vm.write_ram(GDT_GPA, &gdt)?;
@@ -700,11 +812,15 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
             disks,
             card,
             config.touchscreen.then(VirtioInput::default),
+            config.gpu.is_some(),
         )),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,
         display: config.display.clone(),
+        screen_height: config
+            .framebuffer
+            .map_or(0, |screen| usize::from(screen.height)),
         input_script: config.input_script.clone(),
         touch_script: config.touch_script.clone(),
         touch_ready: AtomicBool::new(false),
@@ -712,11 +828,20 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     };
     let kicker = vm.kicker();
     let input = config.shell.then(spawn_stdin_reader);
+    let mut gpu = match (&config.gpu, config.framebuffer) {
+        (Some(folder), Some(screen)) => Some(Gpu {
+            device: VirtioGpu::new(u32::from(screen.width), u32::from(screen.height)),
+            renderer: vm.start_renderer(folder)?,
+            pixels: Vec::new(),
+        }),
+        (Some(_), None) => return Err("a GPU needs a screen size".into()),
+        (None, _) => None,
+    };
 
     let finished = std::thread::scope(|scope| {
         let (timer_shared, timer_kicker) = (&shared, &kicker);
         scope.spawn(move || timer_loop(timer_shared, timer_kicker, input.as_ref()));
-        let result = vcpu_loop(&vm, &shared, deadline);
+        let result = vcpu_loop(&vm, &shared, &mut gpu, deadline);
         shared.stop.store(true, Ordering::Relaxed);
         result
     })
@@ -727,9 +852,23 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let total_ms = started.elapsed().as_secs_f64() * 1e3;
     if let (Some(screen), Some(path)) = (config.framebuffer, &config.screenshot) {
         let mut pixels = vec![0_u8; screen.size_bytes()];
-        vm.read_framebuffer(&mut pixels)?;
+        match gpu.as_mut() {
+            Some(gpu) => {
+                if let Some(shown) = gpu.read_screen() {
+                    virtio_gpu::copy_cropped(
+                        &gpu.pixels,
+                        shown.width,
+                        &mut pixels,
+                        u32::from(screen.width),
+                    );
+                }
+            }
+            None => vm.read_framebuffer(&mut pixels)?,
+        }
         std::fs::write(path, screen.to_bmp(&pixels))?;
     }
+    let gpu_stats = gpu.as_ref().map(|gpu| gpu.device.stats());
+    drop(gpu);
     let boot_to_user_space_ms = ready
         .lock()
         .map_err(|_| "ready lock poisoned")?
@@ -748,6 +887,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         interrupt_window_exits: finished.window_exits,
         io,
         unclaimed_ports,
+        gpu: gpu_stats,
     })
 }
 

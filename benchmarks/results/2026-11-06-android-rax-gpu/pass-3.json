@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "benchmark": "android-rax-boot",
+  "pass": 3,
+  "ram_mib": 2048,
+  "boot_completed_secs": 33
+}
