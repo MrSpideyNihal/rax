@@ -37,6 +37,11 @@ pub fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             Ok(ExitCode::SUCCESS)
         }
         Command::UiPreview { out } => ui_preview(&out),
+        Command::GpuProbe { folder } => {
+            let found = rax_host::virgl::probe(std::path::Path::new(&folder))?;
+            println!("{}", serde_json::to_string_pretty(&found)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Help | Command::Version => unreachable!("handled in main"),
     }
 }

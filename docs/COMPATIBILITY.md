@@ -39,7 +39,8 @@ Status vocabulary: **Tested** means someone ran it and results are in this repos
 | Dragging an APK onto the window | Built, **not tested end to end** |
 | Apps and data surviving a shutdown | **Tested**: both survived a reboot on `data.img` |
 | Software rendering | **Tested**, for booting only. Never a gaming path |
-| Hardware OpenGL ES | Not started |
+| Host renderer on the RTX 3050 | **Tested**: virglrenderer starts on NVIDIA OpenGL 4.6 |
+| Hardware OpenGL ES in Android | Not working yet: the virtio-gpu device is not built |
 | Hardware Vulkan | Not started |
 
 ## Free Fire and BGMI

@@ -29,6 +29,11 @@ pub enum Command {
         /// Path to the profile.
         profile: String,
     },
+    /// Start virglrenderer and report what it can do.
+    GpuProbe {
+        /// Folder holding the renderer DLLs.
+        folder: String,
+    },
     /// Open the launcher.
     Launch,
     /// Save the launcher screen as a BMP.
@@ -79,6 +84,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     match words.as_slice() {
         [] => Ok(Command::Launch),
         ["help" | "-h" | "--help"] => Ok(Command::Help),
+        ["gpu", "probe", folder] => Ok(Command::GpuProbe {
+            folder: (*folder).to_owned(),
+        }),
         ["ui", "preview", out] => Ok(Command::UiPreview {
             out: (*out).to_owned(),
         }),
