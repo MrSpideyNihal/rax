@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use crate::apk::{self, InstallResult};
 use rax_host::window::{self, Button, Event, Window};
+use rax_input::{Input, Key, Mapper, MouseButton, Profile};
 use rax_net::host::Network;
 use rax_ui::{Action, Launcher, MEMORY_CHOICES_MIB, SCREEN_CHOICES, Settings, UI_HEIGHT, UI_WIDTH};
 use rax_vmm::framebuffer::Framebuffer;
@@ -38,7 +39,11 @@ const FRAME_DELAY: Duration = Duration::from_millis(16);
 const IDLE_DELAY: Duration = Duration::from_millis(30);
 /// Right Ctrl, which releases the mouse.
 const RELEASE_SCANCODE: u8 = 0x1d;
-const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, drop an APK to install";
+/// F12, which switches between a normal mouse and game controls.
+const GAME_MODE_SCANCODE: u8 = 0x58;
+const PROFILES: &str = "profiles";
+const BUILT_IN_PROFILE: &str = include_str!("../../../assets/profiles/example-shooter.json");
+const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, F12 game controls, drop an APK to install";
 
 const ANDROID_CMDLINE: &str = "console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
     tsc=reliable androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
@@ -152,8 +157,10 @@ fn android_config(
         framebuffer: None,
         screenshot: None,
         network: None,
+        touchscreen: false,
         display: None,
         input_script: Vec::new(),
+        touch_script: Vec::new(),
     })
 }
 
@@ -205,6 +212,60 @@ fn prepare_data_disk(window: &mut Window, root: &Path) -> Result<(), Box<dyn Err
     }
     std::fs::rename(partial, root.join(DATA))?;
     Ok(())
+}
+
+/// Loads the first key map in the profiles folder, or the built-in one.
+fn load_profile(root: &Path) -> Result<Profile, Box<dyn Error>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join(PROFILES))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let text = match files.first() {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => BUILT_IN_PROFILE.to_owned(),
+    };
+    Ok(Profile::from_json(&text)?)
+}
+
+fn mouse_button(button: Button) -> MouseButton {
+    match button {
+        Button::Left => MouseButton::Left,
+        Button::Right => MouseButton::Right,
+        Button::Middle => MouseButton::Middle,
+    }
+}
+
+/// Translates a window event for the key mapper.
+fn to_mapper_input(event: &Event) -> Option<Input> {
+    match *event {
+        Event::Focus(false) => Some(Input::FocusLost),
+        Event::Key {
+            virtual_key, down, ..
+        } => Some(if down {
+            Input::KeyDown(Key(virtual_key))
+        } else {
+            Input::KeyUp(Key(virtual_key))
+        }),
+        Event::Button { button, down, .. } => {
+            let button = mouse_button(button);
+            Some(if down {
+                Input::ButtonDown(button)
+            } else {
+                Input::ButtonUp(button)
+            })
+        }
+        Event::RawMouse { dx, dy } => Some(Input::MouseMove {
+            dx: dx as f32,
+            dy: dy as f32,
+        }),
+        _ => None,
+    }
 }
 
 /// One APK on its way into Android.
@@ -279,18 +340,56 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     config.ram_mib = MEMORY_CHOICES_MIB[settings.memory];
     config.framebuffer = Some(screen);
     config.network = Some(Network::start());
+    config.touchscreen = true;
     config.display = Some(display.clone());
 
     window.set_title(HINT);
     let guest = std::thread::spawn(move || machine::run(config).map_err(|error| error.to_string()));
     let mut input = InputState::default();
     let mut install: Option<Install> = None;
+    let profile = load_profile(root)?;
+    let profile_name = profile.name.clone();
+    let mut mapper = Mapper::new(profile);
+    let mut game_mode = false;
     let (width, height) = (i32::from(width), i32::from(height));
 
     while !guest.is_finished() {
         let mut queued = Vec::new();
+        let mut touches = Vec::new();
         for event in window.poll() {
             let captured = window.is_captured();
+            if let Event::Key {
+                scancode: GAME_MODE_SCANCODE,
+                down: true,
+                ..
+            } = event
+            {
+                game_mode = !game_mode;
+                if game_mode {
+                    queued.extend(input.release());
+                    window.set_capture(true);
+                    window.set_title(&format!(
+                        "RAX - game controls: {profile_name}. F12 to leave"
+                    ));
+                } else {
+                    touches.extend(mapper.handle(Input::FocusLost));
+                    window.set_title(HINT);
+                }
+                continue;
+            }
+            if game_mode {
+                match event {
+                    Event::Close => display.stop.store(true, Ordering::Relaxed),
+                    Event::Focus(false) => window.set_capture(false),
+                    Event::Focus(true) => window.set_capture(true),
+                    _ => {}
+                }
+                let mapped = to_mapper_input(&event);
+                if let Some(mapped) = mapped {
+                    touches.extend(mapper.handle(mapped));
+                }
+                continue;
+            }
             match event {
                 Event::Close => display.stop.store(true, Ordering::Relaxed),
                 Event::Dropped(path) if install.is_none() => {
@@ -329,6 +428,7 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                     scancode,
                     extended,
                     down,
+                    ..
                 } => queued.push(GuestInput::Key {
                     scancode,
                     extended,
@@ -341,6 +441,11 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
             && let Ok(mut shared) = display.input.lock()
         {
             shared.append(&mut queued);
+        }
+        if !touches.is_empty()
+            && let Ok(mut shared) = display.touches.lock()
+        {
+            shared.append(&mut touches);
         }
         if let Ok(frame) = display.frame.lock() {
             window.present(&frame, width, height);
@@ -397,6 +502,81 @@ mod tests {
         input.button(Button::Left, true);
         assert_eq!(input.release(), Some(GuestInput::MouseButtons(0)));
         assert_eq!(input.release(), None);
+    }
+
+    /// A press on a key bound at (0.5, 0.5), through the path the window uses.
+    fn mapped_touches(event: &Event) -> Vec<rax_input::Touch> {
+        let profile = Profile::from_json(
+            r#"{"name":"t","pointer_toggle":"Alt","bindings":[
+              {"type":"key","key":"R","at":{"x":0.5,"y":0.5}},
+              {"type":"button","button":"Left","at":{"x":0.9,"y":0.9}},
+              {"type":"look","origin":{"x":0.6,"y":0.4},"sensitivity":0.01,"range":0.2}
+            ]}"#,
+        )
+        .unwrap();
+        let mut mapper = Mapper::new(profile);
+        to_mapper_input(event)
+            .map(|input| mapper.handle(input))
+            .unwrap_or_default()
+    }
+
+    fn key_event(virtual_key: u16, down: bool) -> Event {
+        Event::Key {
+            scancode: 0x13,
+            extended: false,
+            down,
+            virtual_key,
+        }
+    }
+
+    #[test]
+    fn a_bound_key_from_the_window_becomes_a_finger() {
+        let touches = mapped_touches(&key_event(0x52, true));
+        assert_eq!(touches.len(), 1);
+        assert_eq!(touches[0].phase, rax_input::Phase::Down);
+        assert_eq!(touches[0].at, rax_input::Point { x: 0.5, y: 0.5 });
+    }
+
+    #[test]
+    fn an_unbound_key_does_nothing() {
+        assert!(mapped_touches(&key_event(0x51, true)).is_empty());
+    }
+
+    #[test]
+    fn a_mouse_button_from_the_window_becomes_a_finger() {
+        let touches = mapped_touches(&Event::Button {
+            button: Button::Left,
+            down: true,
+            x: 0,
+            y: 0,
+        });
+        assert_eq!(touches[0].at, rax_input::Point { x: 0.9, y: 0.9 });
+    }
+
+    #[test]
+    fn raw_mouse_motion_aims() {
+        let touches = mapped_touches(&Event::RawMouse { dx: 5, dy: 0 });
+        assert_eq!(touches.len(), 2, "the finger lands, then drags");
+    }
+
+    #[test]
+    fn losing_focus_reaches_the_mapper() {
+        assert_eq!(
+            to_mapper_input(&Event::Focus(false)),
+            Some(Input::FocusLost)
+        );
+        assert_eq!(to_mapper_input(&Event::Repaint), None);
+    }
+
+    #[test]
+    fn the_built_in_profile_is_valid() {
+        assert!(Profile::from_json(BUILT_IN_PROFILE).is_ok());
+    }
+
+    #[test]
+    fn a_missing_profiles_folder_uses_the_built_in_map() {
+        let root = Path::new("this-folder-does-not-exist");
+        assert!(load_profile(root).is_ok());
     }
 
     #[test]

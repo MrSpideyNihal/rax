@@ -69,6 +69,8 @@ pub struct VmRun {
     pub input_script: Option<String>,
     /// Give the guest a network card.
     pub network: bool,
+    /// File of timed touches. Also adds the touchscreen.
+    pub touch_script: Option<String>,
 }
 
 /// Parses arguments, excluding the program name.
@@ -128,6 +130,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut screenshot = None;
     let mut input_script = None;
     let mut network = false;
+    let mut touch_script = None;
     let mut rest = options.iter();
     while let Some(option) = rest.next() {
         if *option == "--shell" {
@@ -152,6 +155,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
             "--screenshot" => screenshot = Some((*value).to_owned()),
             "--input-script" => input_script = Some((*value).to_owned()),
+            "--touch-script" => touch_script = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -168,6 +172,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         screenshot,
         input_script,
         network,
+        touch_script,
     }))
 }
 
@@ -276,6 +281,7 @@ mod tests {
                 screenshot: None,
                 input_script: None,
                 network: false,
+                touch_script: None,
             }))
         );
     }

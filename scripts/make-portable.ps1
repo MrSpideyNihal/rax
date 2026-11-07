@@ -24,6 +24,8 @@ foreach ($file in 'guest/kernel', 'guest/initrd.img', 'guest/android-x86_64-9.0-
 
 New-Item -ItemType Directory -Force -Path "$Out/guest" | Out-Null
 Copy-Item target/release/rax.exe $Out
+New-Item -ItemType Directory -Force -Path "$Out/profiles" | Out-Null
+Copy-Item assets/profiles/*.json "$Out/profiles"
 Copy-Item LICENSE "$Out/LICENSE.txt"
 Copy-Item guest/kernel, guest/initrd.img, guest/android-x86_64-9.0-r2.iso "$Out/guest"
 @'

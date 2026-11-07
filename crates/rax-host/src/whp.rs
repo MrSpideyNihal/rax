@@ -417,6 +417,10 @@ pub enum VmExit {
         gpa: u64,
         /// Whether it was a write.
         write: bool,
+        /// The instruction, as far as the processor reported it.
+        instruction: [u8; 16],
+        /// Valid bytes in `instruction`.
+        instruction_bytes: u8,
     },
     /// Anything else, including string I/O.
     Other {
@@ -524,10 +528,16 @@ pub(crate) fn read_exit(partition: &Partition<'_>) -> Result<ExitInfo> {
         EXIT_HALT => VmExit::Halted,
         EXIT_INTERRUPT_WINDOW => VmExit::InterruptWindow,
         EXIT_CANCELED => VmExit::Canceled,
-        EXIT_MEMORY => VmExit::Mmio {
-            gpa: little_u64(&exit.union_data, 24),
-            write: little_u32(&exit.union_data, 20) & 0x3 == 1,
-        },
+        EXIT_MEMORY => {
+            let mut instruction = [0; 16];
+            instruction.copy_from_slice(&exit.union_data[4..20]);
+            VmExit::Mmio {
+                gpa: little_u64(&exit.union_data, 24),
+                write: little_u32(&exit.union_data, 20) & 0x3 == 1,
+                instruction,
+                instruction_bytes: exit.union_data[0].min(16),
+            }
+        }
         reason => VmExit::Other { reason },
     };
     let blocked = exit.execution_state & (EXEC_INTERRUPTION_PENDING | EXEC_INTERRUPT_SHADOW) != 0;
@@ -630,6 +640,40 @@ impl Partition<'_> {
                 RegisterValue([rip, 0]),
             ],
         )
+    }
+
+    /// Reads general register `index`, numbered as x86 encodes them.
+    pub(crate) fn general_register(&self, index: u8) -> Result<u64> {
+        Ok(self.register(u32::from(index))?.0[0])
+    }
+
+    /// Finishes a device load: stores `value` and moves past `length` bytes.
+    pub(crate) fn finish_load(
+        &self,
+        info: &ExitInfo,
+        index: u8,
+        size: u8,
+        value: u32,
+        zero_extend: bool,
+        length: u8,
+    ) -> Result<()> {
+        let name = u32::from(index);
+        let merged = if zero_extend {
+            u64::from(value)
+        } else {
+            merge_rax(self.general_register(index)?, size, value)
+        };
+        let rip = info.cpu.rip + u64::from(length);
+        self.set_registers(
+            &[name, REG_RIP],
+            &[RegisterValue([merged, 0]), RegisterValue([rip, 0])],
+        )
+    }
+
+    /// Moves past `length` bytes, for an instruction RAX decoded itself.
+    pub(crate) fn advance(&self, info: &ExitInfo, length: u8) -> Result<()> {
+        let rip = info.cpu.rip + u64::from(length);
+        self.set_registers(&[REG_RIP], &[RegisterValue([rip, 0])])
     }
 
     pub(crate) fn inject_interrupt(&self, vector: u8) -> Result<()> {

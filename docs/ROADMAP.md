@@ -8,7 +8,7 @@ Each phase ends at a gate. A failed gate stops the plan until the recorded alter
 | **1a Own VMM** | `rax vm run`, Linux on RAX's own VMM | Interactive Linux shell under WHP, boot and idle measured | **Done** |
 | **1b Android guest** | virtio-blk, framebuffer, Android 9 boot (all **done**), multiple vCPUs, a current Android version | Android boots under WHP, idle measured | **Gate passed** on Android 9. Multiple vCPUs and a newer Android remain |
 | **2 Graphics** | GPU forwarding on the RTX 3050, GLES test APK built with the local NDK | Hardware rendering confirmed, overhead measured against the Android Emulator | Blocked on 1 |
-| **3 Input** | Key-mapping engine, PS/2 mouse and keyboard, capture (all **done**), virtual touch device | Latency measured, mouse look usable in a test app | In progress: touch needs an MMIO path |
+| **3 Input** | Key mapping, PS/2 mouse and keyboard, capture, multi-touch screen (all **done**) | Latency measured, mouse look usable in a test app | Built. Latency and real-app testing remain |
 | **Decision** | Choose the Play route | Written position from Google, or an explicit decision to remain research | Open |
 | **4 Minecraft** | Compatibility testing | Requires a licensed path from the decision above | Gated |
 | **5 Optimization** | Reclaim, pacing, shader cache, service reduction | Each change has before and after data | Blocked on 2 |

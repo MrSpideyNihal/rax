@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 rax-host.workspace = true
+rax-input.workspace = true
 rax-net.workspace = true
 serde.workspace = true
 

@@ -228,6 +228,8 @@ pub enum Event {
         extended: bool,
         /// True for press.
         down: bool,
+        /// Windows virtual-key code.
+        virtual_key: u16,
     },
     /// The cursor moved, in client coordinates.
     Pointer {
@@ -296,7 +298,7 @@ fn pointer_button(message: u32, l_param: isize) -> Option<Event> {
     })
 }
 
-fn key_event(message: u32, l_param: isize) -> Option<Event> {
+fn key_event(message: u32, w_param: usize, l_param: isize) -> Option<Event> {
     let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
     if !down && !matches!(message, WM_KEYUP | WM_SYSKEYUP) {
         return None;
@@ -308,6 +310,7 @@ fn key_event(message: u32, l_param: isize) -> Option<Event> {
         scancode: ((l_param as u32) >> SCANCODE_SHIFT) as u8,
         extended: l_param & EXTENDED_BIT != 0,
         down,
+        virtual_key: w_param as u16,
     })
 }
 
@@ -365,7 +368,7 @@ unsafe extern "system" fn window_proc(
             x: low_word(l_param),
             y: high_word(l_param),
         }),
-        _ => pointer_button(message, l_param).or_else(|| key_event(message, l_param)),
+        _ => pointer_button(message, l_param).or_else(|| key_event(message, w_param, l_param)),
     };
     if let Some(event) = event {
         push(event);
@@ -641,31 +644,32 @@ mod tests {
     fn scancode_and_flags_decode_from_l_param() {
         let l_param = (0x48 << SCANCODE_SHIFT) | EXTENDED_BIT;
         assert_eq!(
-            key_event(WM_KEYDOWN, l_param),
+            key_event(WM_KEYDOWN, 0x41, l_param),
             Some(Event::Key {
                 scancode: 0x48,
                 extended: true,
-                down: true
+                down: true,
+                virtual_key: 0x41
             })
         );
     }
 
     #[test]
     fn auto_repeat_is_dropped() {
-        assert_eq!(key_event(WM_KEYDOWN, REPEAT_BIT), None);
+        assert_eq!(key_event(WM_KEYDOWN, 0, REPEAT_BIT), None);
     }
 
     #[test]
     fn releases_are_reported_even_with_the_previous_state_bit() {
         assert!(matches!(
-            key_event(WM_KEYUP, REPEAT_BIT),
+            key_event(WM_KEYUP, 0, REPEAT_BIT),
             Some(Event::Key { down: false, .. })
         ));
     }
 
     #[test]
     fn other_messages_are_not_keys() {
-        assert_eq!(key_event(WM_MOUSEMOVE, 0), None);
+        assert_eq!(key_event(WM_MOUSEMOVE, 0, 0), None);
     }
 
     #[test]

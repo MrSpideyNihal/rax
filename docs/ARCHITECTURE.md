@@ -42,8 +42,8 @@ flowchart TB
 |---|---|---|
 | `crates/rax-host` | **exists** | OS integration and all current `unsafe`: WHP, Vulkan probing, host facts, readiness rules, statistics |
 | `crates/rax-vmm` | **exists** | Linux boot protocol, initramfs writer, serial, PIC, PIT, RTC, PCI and virtio-blk devices, one vCPU. Forbids `unsafe` |
-| `crates/rax-input` | **exists, not connected** | Key-mapping profiles, keyboard and mouse to touch events. Forbids `unsafe` |
 | `crates/rax-ui` | **exists** | The launcher: procedural pixel art, a hand-written 5 by 7 font, no toolkit. Forbids `unsafe` |
+| `crates/rax-input` | **exists, connected** | Key-mapping profiles, keyboard and mouse to touch events. Forbids `unsafe` |
 | `crates/rax-net` | **exists** | User-mode NAT: ARP, DHCP, DNS, UDP and a TCP proxy over Windows sockets. Forbids `unsafe` |
 | `crates/rax-cli` | **exists** | `rax doctor`, `rax bench whp`, `rax vm run`, `rax input check`. Forbids `unsafe` |
 | Multiple vCPUs, more virtio devices | planned, Phase 1b | Required before Android is usable |
@@ -87,7 +87,13 @@ The guest draws into a linear framebuffer described through `screen_info`, so th
 
 ### Mouse and keyboard
 
-An emulated 8042 with PS/2 keyboard and mouse reaches the guest through port I/O. Windows scancodes are already set 1, so there is no key table. Both devices always exist in the guest, so the host's hardware coming and going cannot disturb them. This gives Android a pointer, and multi-finger touch for key mapping is still to come.
+An emulated 8042 with PS/2 keyboard and mouse reaches the guest through port I/O. Windows scancodes are already set 1, so there is no key table. Both devices always exist in the guest, so the host's hardware coming and going cannot disturb them. This gives Android a pointer.
+
+### Touch and key mapping
+
+F12 switches the window between a normal mouse and game controls. In game controls, `rax-input` turns keys and mouse into fingers, which reach Android through a virtio multi-touch screen. Profiles load from a `profiles` folder beside the executable, falling back to a built-in example.
+
+virtio-input has no legacy form, so it uses the modern memory-mapped interface. When the guest touches device memory, the hypervisor reports the address and instruction bytes, and `mmio.rs` decodes the plain `mov` forms Linux uses, refusing anything else. The same path is what a future `virtio-gpu` would need.
 
 ### Storage
 

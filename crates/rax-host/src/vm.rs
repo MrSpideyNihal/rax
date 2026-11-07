@@ -103,6 +103,30 @@ impl<'a> Vm<'a> {
         self.partition.skip_instruction(info)
     }
 
+    /// Reads general register `index`, numbered as x86 encodes them.
+    pub fn general_register(&self, index: u8) -> Result<u64> {
+        self.partition.general_register(index)
+    }
+
+    /// Finishes a decoded device load.
+    pub fn finish_load(
+        &self,
+        info: &ExitInfo,
+        index: u8,
+        size: u8,
+        value: u32,
+        zero_extend: bool,
+        length: u8,
+    ) -> Result<()> {
+        self.partition
+            .finish_load(info, index, size, value, zero_extend, length)
+    }
+
+    /// Moves past a decoded instruction of `length` bytes.
+    pub fn advance(&self, info: &ExitInfo, length: u8) -> Result<()> {
+        self.partition.advance(info, length)
+    }
+
     /// Delivers an external interrupt. Only valid when `info.interruptible`.
     pub fn inject_interrupt(&self, vector: u8) -> Result<()> {
         self.partition.inject_interrupt(vector)
