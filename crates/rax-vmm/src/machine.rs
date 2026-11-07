@@ -149,6 +149,8 @@ pub struct Display {
     pub console_input: Arc<Mutex<Vec<u8>>>,
     /// What the console has printed, newest last.
     pub console_output: Arc<Mutex<String>>,
+    /// Frames the guest has presented so far.
+    pub frames: Arc<AtomicU64>,
 }
 
 impl Display {
@@ -162,6 +164,7 @@ impl Display {
             touches: Arc::new(Mutex::new(Vec::new())),
             console_input: Arc::new(Mutex::new(Vec::new())),
             console_output: Arc::new(Mutex::new(String::new())),
+            frames: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -592,7 +595,11 @@ fn render_once(
     let mut device = link.device.lock().map_err(|_| "GPU lock poisoned")?;
     device.service(&RamView(vm, shared), renderer);
     let finished = device.take_irq();
+    let frames = device.stats().flushes;
     drop(device);
+    if let Some(display) = &shared.display {
+        display.frames.store(frames, Ordering::Relaxed);
+    }
     if finished {
         let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
         bus.raise_gpu();

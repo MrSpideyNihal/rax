@@ -7,7 +7,7 @@ use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::apk::{self, InstallResult};
 use rax_host::window::{self, Button, Event, Window};
@@ -75,6 +75,8 @@ const SESSION_CPUS: u8 = 4;
 /// The folder `scripts/fetch-gpu.ps1` fills.
 const GPU_FOLDER: &str = "gpu";
 const GPU_LIBRARY: &str = "libvirglrenderer-1.dll";
+/// How often the frame rate in the title bar updates.
+const TITLE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn android_cmdline(data_arg: &str, gpu: bool, apic: bool) -> String {
     let graphics = if gpu { "" } else { SOFTWARE_GRAPHICS };
@@ -404,6 +406,45 @@ impl InputState {
     }
 }
 
+/// A window into Android's console for diagnosing a live session. Set
+/// `RAX_CONSOLE_DIR`, and RAX appends the console to `console.log` there and
+/// types whatever appears in `console.in`, then deletes that file.
+struct ConsoleTap {
+    log: std::fs::File,
+    commands: PathBuf,
+    seen: usize,
+}
+
+impl ConsoleTap {
+    fn from_environment() -> Option<Self> {
+        let folder = PathBuf::from(std::env::var_os("RAX_CONSOLE_DIR")?);
+        std::fs::create_dir_all(&folder).ok()?;
+        let log = std::fs::File::create(folder.join("console.log")).ok()?;
+        Some(Self {
+            log,
+            commands: folder.join("console.in"),
+            seen: 0,
+        })
+    }
+
+    fn pump(&mut self, display: &Display) {
+        if let Ok(text) = display.console_output.lock() {
+            // The buffer drops old text when full, which restarts the count.
+            if text.len() < self.seen {
+                self.seen = 0;
+            }
+            let _ = self.log.write_all(&text.as_bytes()[self.seen..]);
+            self.seen = text.len();
+        }
+        if let Ok(commands) = std::fs::read(&self.commands) {
+            let _ = std::fs::remove_file(&self.commands);
+            if let Ok(mut typed) = display.console_input.lock() {
+                typed.extend_from_slice(&commands);
+            }
+        }
+    }
+}
+
 /// Runs Android until the user closes the window.
 fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), Box<dyn Error>> {
     let (width, height) = SCREEN_CHOICES[settings.screen];
@@ -423,8 +464,11 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     config.touchscreen = true;
     config.display = Some(display.clone());
 
-    window.set_title(HINT);
+    let mut title = HINT.to_owned();
     let guest = std::thread::spawn(move || machine::run(config).map_err(|error| error.to_string()));
+    let mut last_title = Instant::now();
+    let mut last_frames = 0;
+    let mut tap = ConsoleTap::from_environment();
     let mut input = InputState::default();
     let mut install: Option<Install> = None;
     let profile = load_profile(root)?;
@@ -448,12 +492,12 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                 if game_mode {
                     queued.extend(input.release());
                     window.set_capture(true);
-                    window.set_title(&format!(
+                    title.clone_from(&format!(
                         "RAX - game controls: {profile_name}. F12 to leave"
                     ));
                 } else {
                     touches.extend(mapper.handle(Input::FocusLost));
-                    window.set_title(HINT);
+                    title = HINT.to_owned();
                 }
                 continue;
             }
@@ -475,10 +519,10 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                 Event::Dropped(path) if install.is_none() => {
                     match begin_install(&path, &inbox, &display) {
                         Ok(started) => {
-                            window.set_title(&format!("RAX - installing {}...", started.name));
+                            title.clone_from(&format!("RAX - installing {}...", started.name));
                             install = Some(started);
                         }
-                        Err(error) => window.set_title(&format!("RAX - {error}")),
+                        Err(error) => title.clone_from(&format!("RAX - {error}")),
                     }
                 }
                 Event::Focus(false) => {
@@ -529,12 +573,22 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
         if let Ok(frame) = display.frame.lock() {
             window.present(&frame, width, height);
         }
+        if last_title.elapsed() >= TITLE_INTERVAL {
+            let frames = display.frames.load(Ordering::Relaxed);
+            let rate =
+                frames.saturating_sub(last_frames) as f64 / last_title.elapsed().as_secs_f64();
+            window.set_title(&format!("{rate:.0} FPS - {title}"));
+            (last_frames, last_title) = (frames, Instant::now());
+        }
+        if let Some(tap) = tap.as_mut() {
+            tap.pump(&display);
+        }
         let finished = install.as_ref().and_then(|_| {
             let text = display.console_output.lock().ok()?;
             apk::parse_result(&text)
         });
         if let (Some(result), Some(done)) = (finished, &install) {
-            window.set_title(&match result {
+            title.clone_from(&match result {
                 InstallResult::Installed => format!("RAX - installed {}", done.name),
                 InstallResult::Failed(reason) => {
                     format!("RAX - could not install {}: {reason}", done.name)
