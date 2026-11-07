@@ -112,6 +112,7 @@ unsafe extern "system" {
     fn wglMakeCurrent(hdc: Hdc, context: Hglrc) -> i32;
     fn wglGetProcAddress(name: *const c_char) -> *const c_void;
     fn glGetString(name: u32) -> *const c_char;
+    fn glFlush();
     fn glEnable(capability: u32);
 }
 
@@ -706,14 +707,20 @@ impl Renderer<'_> {
         unsafe { (self.functions.force_context_zero)() }
     }
 
-    /// Sends everything queued to the GPU, by creating a fence. Without
-    /// this the work can sit in the driver, and a guest waiting on a query
-    /// result asks again and again for an answer that isn't coming.
+    /// Sends everything queued to the GPU. Without this the work can sit in
+    /// the driver, and a guest waiting on a query result asks again and again
+    /// for an answer that isn't coming. The explicit flush covers the guest's
+    /// own context, which is current after a submit. The fence alone only
+    /// flushes the renderer's first context.
     pub fn flush(&mut self) {
         self.next_fence = self.next_fence.wrapping_add(1);
-        // SAFETY: the renderer is running on its own thread, and context zero
-        // is the one it always has.
-        unsafe { (self.functions.create_fence)(self.next_fence as c_int, 0) };
+        // SAFETY: this runs on the thread owning the renderer's contexts, one
+        // of which is current, and the renderer is running. Context zero is
+        // the one it always has.
+        unsafe {
+            glFlush();
+            (self.functions.create_fence)(self.next_fence as c_int, 0);
+        }
     }
 
     /// Lets the renderer finish queued work, such as query results.
