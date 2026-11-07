@@ -11,6 +11,7 @@ pub mod assess;
 pub mod dylib;
 pub mod error;
 pub mod host;
+pub mod sparse;
 pub mod stats;
 pub mod virgl;
 pub mod vm;

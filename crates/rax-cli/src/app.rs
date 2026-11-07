@@ -24,7 +24,9 @@ const INITRD: &str = "guest/initrd.img";
 const SYSTEM: &str = "guest/android-x86_64-9.0-r2.iso";
 /// Android's own data, which is what keeps apps between runs.
 const DATA: &str = "data.img";
-const DATA_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// The disk apps and games live on. It is sparse, so this is a limit, not a
+/// cost: the file only uses what Android has really written.
+const DATA_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Spare disk that carries an APK into Android during a session.
 const INBOX: &str = "inbox.tmp";
 /// A blank data disk is formatted by Android itself, at its console.
@@ -242,6 +244,8 @@ fn android_config(
 fn prepare_data_disk(window: &mut Window, root: &Path) -> Result<(), Box<dyn Error>> {
     let partial = root.join("data.tmp");
     let file = std::fs::File::create(&partial)?;
+    // On a disk without sparse files this still works, using the full size.
+    let _ = rax_host::sparse::mark_sparse(&file);
     file.set_len(DATA_BYTES)?;
     drop(file);
 
@@ -356,6 +360,9 @@ fn begin_install(path: &Path, inbox: &Path, display: &Display) -> Result<Install
     let bytes = std::fs::read(path)?;
     if bytes.len() as u64 > apk::INBOX_BYTES {
         return Err("That APK is larger than 1 GB".into());
+    }
+    if apk::is_arm_only(&bytes) {
+        return Err(format!("{name} is ARM-only, and RAX can't run ARM apps yet").into());
     }
     let mut file = std::fs::OpenOptions::new().write(true).open(inbox)?;
     file.write_all(&bytes)?;
@@ -474,7 +481,10 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     let screen = Framebuffer { width, height };
     let display = Display::new(screen.size_bytes());
     let inbox = root.join(INBOX);
-    std::fs::File::create(&inbox)?.set_len(apk::INBOX_BYTES)?;
+    let inbox_file = std::fs::File::create(&inbox)?;
+    let _ = rax_host::sparse::mark_sparse(&inbox_file);
+    inbox_file.set_len(apk::INBOX_BYTES)?;
+    drop(inbox_file);
     let disks = vec![root.join(SYSTEM), root.join(DATA), inbox.clone()];
     let mut config = android_config(root, "vdb", disks)?;
     config.ram_mib = MEMORY_CHOICES_MIB[settings.memory];

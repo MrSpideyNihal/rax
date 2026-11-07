@@ -49,19 +49,22 @@ Goals, not support claims. See [ADR-0007](ADR/0007-game-goals-and-input.md).
 
 | Item | Free Fire | BGMI |
 |---|---|---|
-| Runs on RAX | **Not tested** | **Not tested, and blocked** |
-| Native x86 build | Not confirmed | None listed, `arm64-v8a` only |
+| Runs on RAX | **Tested, does not run.** Free Fire MAX 2.133.1 installs, then crashes with `UnsatisfiedLinkError` | **Not tested, and blocked** |
+| Native x86 build | None received: Play installed it as `armeabi-v7a` | None listed, `arm64-v8a` only |
 | Emulator rules | Reported separate pool and leaderboard exclusion | Reported banned from competitive events |
 | Key mapping | Connected, positions not set | Connected, positions not set |
 
 Your account carries the risk of following or breaking each game's rules. RAX does not hide from anti-cheat, and has no macros.
 
+**Why ARM games fail:** the image has no ARM translator. `libhoudini.so` is an empty placeholder. Android-x86's "Native bridge" switch would download one over plain HTTP from URL shorteners, with no checksum, to run with high privileges. RAX does not use it, and its licence is unclear. RAX refuses an ARM-only APK dropped on its window with a clear message, instead of letting it crash. Finding a legally usable translator is the next step for these games.
+
 ## Minecraft Bedrock (Android)
 
 | Item | Status | Evidence |
 |---|---|---|
-| Runs on RAX | **Not tested** | |
-| x86_64 Android build | Listed version code, conflicting community report | [FEASIBILITY §6](FEASIBILITY.md#6-android-arm-compatibility-strategy) |
+| Runs on RAX | **Tested by hand** on version 1.26.62.1: reaches the menu, loads worlds, and handles TNT | Live session, 2026-11-07 |
+| Frame rate | Holds about 60 FPS, peak 61, capped by Android's 60 Hz screen. Falls to 6 to 8 FPS with about 30,000 TNT, when the game's own physics threads are full | Title bar and guest `top`. Not a formal benchmark |
+| x86_64 Android build | **Confirmed**: it runs from `lib/x86_64` | Stack dumps from the guest |
 | Graphics API | OpenGL ES (RenderDragon) | Minecraft Wiki |
 | Mouse and keyboard on Android | Unverified | |
 | Installation from Google Play | **Not supported.** RAX has no licensed Play environment. The current test image contains Google's apps, which must be fixed | [ADR-0005](ADR/0005-google-play-policy.md) |

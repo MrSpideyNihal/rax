@@ -5,7 +5,7 @@
 
 **A research project to build the lightest practical Android gaming runtime for Windows, in Rust.**
 
-> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. It has internet, and it draws on the host GPU through API forwarding. No game has been tested yet.** No FPS, game RAM, or thermal figure exists, and none will be claimed until real benchmarks do.
+> **Status: Android 9 runs in RAX's own window with mouse and keyboard, on RAX's own VM. It has internet, runs on four virtual CPUs, and draws on the host GPU through API forwarding. Minecraft Bedrock loads worlds and is playable in early testing, with a peak of 61 FPS seen on an RTX 3050. ARM-only games such as Free Fire MAX do not run.** Formal game benchmarks and thermal figures do not exist yet.
 
 ![The RAX launcher](docs/images/launcher.png)
 
@@ -36,7 +36,7 @@ Read the [feasibility report](docs/FEASIBILITY.md). The short version:
 
 - **The runtime looks buildable.** WHP works, and exit cost is not the bottleneck. Game speed through GPU forwarding is the hard part still ahead.
 - **Google Play is the real obstacle.** It needs a licence from Google, and engineering cannot replace that. RAX will not bundle, spoof or bypass it ([ADR-0005](docs/ADR/0005-google-play-policy.md)).
-- **ARM translation may be avoidable for Minecraft,** which lists an x86_64 Android build, though that is untested here. **BGMI is listed as ARM-only, so it is blocked** until a legal translation path exists.
+- **Minecraft does not need ARM translation.** Its x86_64 build runs on RAX. **BGMI is listed as ARM-only, so it is blocked** until a legal translation path exists.
 - **Free Fire and BGMI are goals, not promises.** RAX has no macros and will not hide from anti-cheat ([ADR-0007](docs/ADR/0007-game-goals-and-input.md)).
 - **There is no GPU passthrough.** Android's OpenGL ES commands are forwarded to the host through virglrenderer, and we call it API forwarding.
 

@@ -10,7 +10,7 @@ Each phase ends at a gate. A failed gate stops the plan until the recorded alter
 | **2 Graphics** | virglrenderer on the RTX 3050, virtio-gpu device (both **done**), GLES test APK built with the local NDK | Hardware rendering confirmed, overhead measured against the Android Emulator | Hardware rendering confirmed. Frame rate unmeasured |
 | **3 Input** | Key mapping, PS/2 mouse and keyboard, capture, multi-touch screen (all **done**) | Latency measured, mouse look usable in a test app | Built. Latency and real-app testing remain |
 | **Decision** | Choose the Play route | Written position from Google, or an explicit decision to remain research | Open |
-| **4 Minecraft** | Compatibility testing | Requires a licensed path from the decision above | Gated |
+| **4 Minecraft** | Compatibility testing | Requires a licensed path from the decision above | Runs in hand testing on a test image. Public release gated |
 | **5 Optimization** | Reclaim, pacing, shader cache, service reduction | Each change has before and after data | Blocked on 2 |
 | **6 Distribution** | Installer, updates, sandboxing, signed releases | Legal review complete | Gated |
 
