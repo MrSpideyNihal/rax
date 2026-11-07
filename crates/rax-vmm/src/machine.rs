@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::Thread;
@@ -60,8 +60,6 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const HALT_POLL: Duration = Duration::from_millis(50);
 /// The longest the guest waits for RAM to finish being released.
 const RELEASE_WAIT: Duration = Duration::from_secs(5);
-/// Virtual CPUs given to the guest.
-const CPUS: u8 = 1;
 /// How long the render thread stays awake after finishing work.
 const RENDER_SPIN: Duration = Duration::from_micros(200);
 /// Console text kept for a running app, in bytes.
@@ -126,6 +124,8 @@ pub struct Config {
     /// Uses the hypervisor's local APIC and an I/O APIC, for guests that
     /// boot without `nolapic noapic`.
     pub apic: bool,
+    /// Virtual CPUs. More than one needs `apic`.
+    pub cpus: u8,
     /// Connects a live window. `None` runs headless.
     pub display: Option<Display>,
     /// Timed input, for repeatable tests with no person at the keyboard.
@@ -207,12 +207,13 @@ pub struct Report {
     pub gpu: Option<GpuStats>,
 }
 
-struct Finished {
-    outcome: Outcome,
-    exits: u64,
-    interrupts: u64,
-    floating_pages: u64,
-    window_exits: u64,
+/// Totals across all vCPUs.
+#[derive(Default)]
+struct Counters {
+    exits: AtomicU64,
+    interrupts: AtomicU64,
+    floating_pages: AtomicU64,
+    window_exits: AtomicU64,
 }
 
 /// Writes the console to stdout and notes when the marker appears.
@@ -297,6 +298,7 @@ struct Shared {
     deadline: Instant,
     /// The GPU, if there is one.
     gpu: Option<GpuLink>,
+    counters: Counters,
 }
 
 /// Work for the thread that gives RAM back. Windows takes up to milliseconds
@@ -365,6 +367,7 @@ fn timer_loop(
 ) {
     let mut script_position = 0;
     let mut touch_position = 0;
+    let mut last_screen_kick = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
         let now = shared.now_ns();
         let window_input: Vec<GuestInput> = shared
@@ -429,6 +432,15 @@ fn timer_loop(
                 .as_ref()
                 .is_some_and(|display| display.stop.load(Ordering::Relaxed));
         if stopping {
+            kicker.kick_all();
+        }
+        // The vCPU also copies a software screen, and a sleeping guest no
+        // longer exits by itself.
+        if shared.gpu.is_none()
+            && shared.display.is_some()
+            && last_screen_kick.elapsed() >= FRAME_INTERVAL
+        {
+            last_screen_kick = Instant::now();
             kicker.kick();
         }
         if pending || shared.network_pending() {
@@ -680,7 +692,9 @@ fn device_memory(
         if access.write {
             let value = match access.immediate {
                 Some(value) => value,
-                None => stored_register(vm.general_register(access.register)?, access.size),
+                None => {
+                    stored_register(vm.general_register(info.vp, access.register)?, access.size)
+                }
             };
             // A notification must not wait for the draw in progress.
             if offset == NOTIFY_OFFSET {
@@ -715,7 +729,7 @@ fn device_memory(
     if access.write {
         let value = match access.immediate {
             Some(value) => value,
-            None => stored_register(vm.general_register(access.register)?, access.size),
+            None => stored_register(vm.general_register(info.vp, access.register)?, access.size),
         };
         bus.memory_write(gpa, value);
         bus.service_devices(&RamView(vm, shared));
@@ -732,6 +746,19 @@ fn device_memory(
         )?;
     }
     Ok(())
+}
+
+/// Picks what to report from all the CPUs: any failure, then the first real
+/// reason to stop. The rest only stopped because one CPU did.
+fn choose_outcome(results: Vec<Result<Outcome, String>>) -> Result<Outcome, Box<dyn Error>> {
+    let mut outcome = Outcome::Stopped;
+    for result in results {
+        let this = result?;
+        if outcome == Outcome::Stopped {
+            outcome = this;
+        }
+    }
+    Ok(outcome)
 }
 
 /// What to do about interrupts before the vCPU next runs.
@@ -759,30 +786,25 @@ fn delivery(pending: Option<u8>, interruptible: bool) -> Delivery {
 fn vcpu_loop(
     vm: &Vm<'_>,
     shared: &Shared,
+    vp: u32,
     interrupter: &Interrupter<'_>,
     deadline: Instant,
-) -> Result<Finished, Box<dyn Error>> {
-    let mut exits = 0_u64;
-    let mut interrupts = 0_u64;
-    let mut floating_pages = 0_u64;
-    let mut window_exits = 0_u64;
+) -> Result<Outcome, Box<dyn Error>> {
+    let counters = &shared.counters;
     let mut last_frame = Instant::now();
     let mut interruptible = false;
     let mut last_speaker_poll = 0;
     loop {
-        let frame_due = last_frame.elapsed() >= FRAME_INTERVAL;
+        if shared.stop.load(Ordering::Relaxed) {
+            return Ok(Outcome::Stopped);
+        }
+        let frame_due = vp == 0 && last_frame.elapsed() >= FRAME_INTERVAL;
         if frame_due {
             last_frame = Instant::now();
         }
         if let Some(display) = &shared.display {
             if display.stop.load(Ordering::Relaxed) {
-                return Ok(Finished {
-                    outcome: Outcome::Stopped,
-                    exits,
-                    interrupts,
-                    floating_pages,
-                    window_exits,
-                });
+                return Ok(Outcome::Stopped);
             }
             if frame_due
                 && shared.gpu.is_none()
@@ -792,22 +814,10 @@ fn vcpu_loop(
             }
         }
         if shared.powered_off.load(Ordering::Relaxed) {
-            return Ok(Finished {
-                outcome: Outcome::PoweredOff,
-                exits,
-                interrupts,
-                floating_pages,
-                window_exits,
-            });
+            return Ok(Outcome::PoweredOff);
         }
         if Instant::now() >= deadline {
-            return Ok(Finished {
-                outcome: Outcome::TimedOut,
-                exits,
-                interrupts,
-                floating_pages,
-                window_exits,
-            });
+            return Ok(Outcome::TimedOut);
         }
         {
             let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
@@ -823,28 +833,25 @@ fn vcpu_loop(
                 bus.service_devices(&RamView(vm, shared));
             }
             if bus.reset_requested() {
-                return Ok(Finished {
-                    outcome: Outcome::Reset,
-                    exits,
-                    interrupts,
-                    floating_pages,
-                    window_exits,
-                });
+                return Ok(Outcome::Reset);
             }
             send_interrupts(interrupter, bus.take_interrupts());
-            match delivery(bus.pending_vector(), interruptible) {
-                Delivery::Inject(vector) => {
-                    vm.inject_interrupt(vector)?;
-                    bus.acknowledge_interrupt();
-                    interrupts += 1;
+            // The 8259 is wired to the first CPU only.
+            if vp == 0 {
+                match delivery(bus.pending_vector(), interruptible) {
+                    Delivery::Inject(vector) => {
+                        vm.inject_interrupt(vector)?;
+                        bus.acknowledge_interrupt();
+                        counters.interrupts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Delivery::AskForWindow => vm.request_interrupt_window()?,
+                    Delivery::Nothing => {}
                 }
-                Delivery::AskForWindow => vm.request_interrupt_window()?,
-                Delivery::Nothing => {}
             }
         }
 
-        let info = vm.run()?;
-        exits += 1;
+        let info = vm.run(vp)?;
+        counters.exits.fetch_add(1, Ordering::Relaxed);
         interruptible = info.interruptible;
         match info.exit {
             VmExit::PortRead { port, size } => {
@@ -871,18 +878,17 @@ fn vcpu_loop(
                 vm.skip_instruction(&info)?;
             }
             VmExit::Halted => {
+                if vp != 0 {
+                    continue;
+                }
                 if !info.interruptible {
-                    return Ok(Finished {
-                        outcome: Outcome::PoweredOff,
-                        exits,
-                        interrupts,
-                        floating_pages,
-                        window_exits,
-                    });
+                    return Ok(Outcome::PoweredOff);
                 }
                 wait_while_halted(shared, deadline)?;
             }
-            VmExit::InterruptWindow => window_exits += 1,
+            VmExit::InterruptWindow => {
+                counters.window_exits.fetch_add(1, Ordering::Relaxed);
+            }
             VmExit::Canceled => {}
             VmExit::Mmio {
                 gpa,
@@ -904,7 +910,7 @@ fn vcpu_loop(
                 // Linux probes for chipset registers that this machine does
                 // not have, and expects all ones when nothing answers.
                 vm.map_floating_page(gpa)?;
-                floating_pages += 1;
+                counters.floating_pages.fetch_add(1, Ordering::Relaxed);
             }
             VmExit::Mmio { gpa, write, .. } => {
                 return Err(format!(
@@ -980,9 +986,17 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         None => command_line(&api, !disks.is_empty() || config.network.is_some()),
     };
 
-    let mut vm = Vm::with_local_apic(&api, config.ram_mib * 1024 * 1024, config.apic)?;
+    if config.cpus > 1 && !config.apic {
+        return Err("more than one CPU needs the APIC".into());
+    }
+    let mut vm = Vm::with_local_apic(
+        &api,
+        config.ram_mib * 1024 * 1024,
+        u32::from(config.cpus.max(1)),
+        config.apic,
+    )?;
     if config.apic {
-        vm.write_ram(mptable::MP_GPA, &mptable::build(CPUS))?;
+        vm.write_ram(mptable::MP_GPA, &mptable::build(config.cpus.max(1)))?;
     }
     // With a GPU, the guest finds its screen there and not in the boot data.
     let vesa_screen = config.framebuffer.filter(|_| config.gpu.is_none());
@@ -1056,6 +1070,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         releases,
         powered_off,
         deadline,
+        counters: Counters::default(),
         gpu: config.gpu.as_ref().and(config.framebuffer).map(|screen| {
             GpuLink::new(VirtioGpu::new(
                 u32::from(screen.width),
@@ -1071,7 +1086,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
             .bus
             .lock()
             .map_err(|_| "device lock poisoned")?
-            .add_ioapic(CPUS);
+            .add_ioapic(config.cpus.max(1));
     }
     let kicker = vm.kicker();
     let interrupter = vm.interrupter();
@@ -1112,9 +1127,33 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
                 return Err(error.into());
             }
         }
-        let result = vcpu_loop(&vm, &shared, &interrupter, deadline);
-        shared.stop.store(true, Ordering::Relaxed);
-        result
+        let run_cpu = |vp: u32| {
+            let result = vcpu_loop(&vm, &shared, vp, &interrupter, deadline)
+                .map_err(|error| error.to_string());
+            // One CPU stopping means the whole guest has stopped.
+            shared.stop.store(true, Ordering::Relaxed);
+            kicker.kick_all();
+            result
+        };
+        let others: Vec<_> = (1..u32::from(config.cpus))
+            .map(|vp| scope.spawn(move || run_cpu(vp)))
+            .collect();
+        let first = run_cpu(0);
+        // A CPU can be between its stop check and running the guest, where a
+        // single kick would be lost.
+        while !others
+            .iter()
+            .all(std::thread::ScopedJoinHandle::is_finished)
+        {
+            kicker.kick_all();
+            std::thread::sleep(TIMER_IDLE);
+        }
+        let mut results = vec![first];
+        results.extend(others.into_iter().map(|cpu| {
+            cpu.join()
+                .unwrap_or_else(|_| Err(String::from("a vCPU thread panicked")))
+        }));
+        choose_outcome(results)
     })
     .inspect(|_| {
         let _ = std::io::stdout().flush();
@@ -1151,14 +1190,14 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let (io, unclaimed_ports) = (bus.stats(), bus.busiest_unclaimed_ports(5));
     drop(bus);
     Ok(Report {
-        outcome: finished.outcome,
+        outcome: finished,
         ram_mib: config.ram_mib,
         boot_to_user_space_ms,
         total_ms,
-        vcpu_exits: finished.exits,
-        interrupts: finished.interrupts,
-        floating_pages: finished.floating_pages,
-        interrupt_window_exits: finished.window_exits,
+        vcpu_exits: shared.counters.exits.load(Ordering::Relaxed),
+        interrupts: shared.counters.interrupts.load(Ordering::Relaxed),
+        floating_pages: shared.counters.floating_pages.load(Ordering::Relaxed),
+        interrupt_window_exits: shared.counters.window_exits.load(Ordering::Relaxed),
         io,
         unclaimed_ports,
         gpu: gpu_stats,
@@ -1224,6 +1263,28 @@ mod tests {
         // ten times the fastest read.
         const { assert!(10_000_000 / SPEAKER_POLL_NS >= 1000) };
         const { assert!(50_000 < 10 * SPEAKER_POLL_NS) };
+    }
+
+    #[test]
+    fn a_real_outcome_beats_cpus_that_merely_stopped() {
+        let results = vec![
+            Ok(Outcome::Stopped),
+            Ok(Outcome::Reset),
+            Ok(Outcome::Stopped),
+        ];
+        assert_eq!(choose_outcome(results).unwrap(), Outcome::Reset);
+    }
+
+    #[test]
+    fn the_first_cpu_to_stop_for_a_reason_wins() {
+        let results = vec![Ok(Outcome::TimedOut), Ok(Outcome::PoweredOff)];
+        assert_eq!(choose_outcome(results).unwrap(), Outcome::TimedOut);
+    }
+
+    #[test]
+    fn a_failure_on_any_cpu_is_reported() {
+        let results = vec![Ok(Outcome::Stopped), Err(String::from("bad"))];
+        assert!(choose_outcome(results).is_err());
     }
 
     #[test]

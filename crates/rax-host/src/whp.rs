@@ -43,6 +43,9 @@ const REG_GDTR: u32 = 0x1b;
 const REG_CR0: u32 = 0x1c;
 const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
 const REG_DELIVERABILITY: u32 = 0x8000_0004;
+const REG_INTERNAL_ACTIVITY: u32 = 0x8000_0005;
+/// Waiting for a startup interrupt, as a second CPU does at power on.
+const ACTIVITY_STARTUP_SUSPEND: u64 = 1;
 
 const EXIT_MEMORY: u32 = 0x0001;
 const EXIT_IO_PORT: u32 = 0x0002;
@@ -308,31 +311,41 @@ impl<'a> Partition<'a> {
         check("WHvCreateVirtualProcessor", hr)
     }
 
-    fn register(&self, name: u32) -> Result<RegisterValue> {
+    /// Holds a CPU until the boot CPU starts it, as hardware does.
+    pub(crate) fn hold_for_startup(&self, vp: u32) -> Result<()> {
+        self.set_registers(
+            vp,
+            &[REG_INTERNAL_ACTIVITY],
+            &[RegisterValue([ACTIVITY_STARTUP_SUSPEND, 0])],
+        )
+    }
+
+    fn register(&self, vp: u32, name: u32) -> Result<RegisterValue> {
         let mut value = RegisterValue::default();
         // SAFETY: both pointers refer to exactly one element, matching the count.
-        let hr =
-            unsafe { (self.api.get_registers)(self.handle, 0, &raw const name, 1, &raw mut value) };
+        let hr = unsafe {
+            (self.api.get_registers)(self.handle, vp, &raw const name, 1, &raw mut value)
+        };
         check("WHvGetVirtualProcessorRegisters", hr)?;
         Ok(value)
     }
 
-    fn set_registers(&self, names: &[u32], values: &[RegisterValue]) -> Result<()> {
+    fn set_registers(&self, vp: u32, names: &[u32], values: &[RegisterValue]) -> Result<()> {
         debug_assert_eq!(names.len(), values.len());
         let count = names.len().min(values.len()) as u32;
         // SAFETY: both slices hold at least `count` elements.
         let hr = unsafe {
-            (self.api.set_registers)(self.handle, 0, names.as_ptr(), count, values.as_ptr())
+            (self.api.set_registers)(self.handle, vp, names.as_ptr(), count, values.as_ptr())
         };
         check("WHvSetVirtualProcessorRegisters", hr)
     }
 
-    fn run(&self, exit: &mut ExitContext) -> Result<()> {
+    fn run(&self, vp: u32, exit: &mut ExitContext) -> Result<()> {
         // SAFETY: `exit` is a writable WHV_RUN_VP_EXIT_CONTEXT of the size passed.
         let hr = unsafe {
             (self.api.run_virtual_processor)(
                 self.handle,
-                0,
+                vp,
                 std::ptr::from_mut(exit).cast(),
                 size_of::<ExitContext>() as u32,
             )
@@ -528,6 +541,8 @@ pub struct ExitInfo {
     pub cpu: CpuState,
     /// Whether an external interrupt can be injected now.
     pub interruptible: bool,
+    /// The virtual processor that exited.
+    pub vp: u32,
     instruction_length: u8,
     rax: u64,
 }
@@ -603,11 +618,11 @@ fn merge_rax(rax: u64, size: u8, value: u32) -> u64 {
     }
 }
 
-/// Runs vCPU 0 until the next exit and decodes it.
-pub(crate) fn read_exit(partition: &Partition<'_>) -> Result<ExitInfo> {
+/// Runs a vCPU until its next exit and decodes it.
+pub(crate) fn read_exit(partition: &Partition<'_>, vp: u32) -> Result<ExitInfo> {
     // SAFETY: ExitContext is plain integers, so all-zero is a valid value.
     let mut exit: ExitContext = unsafe { std::mem::zeroed() };
-    partition.run(&mut exit)?;
+    partition.run(vp, &mut exit)?;
     let mut rax = 0;
     let decoded = match exit.reason {
         EXIT_IO_PORT => {
@@ -638,6 +653,7 @@ pub(crate) fn read_exit(partition: &Partition<'_>) -> Result<ExitInfo> {
             rflags: exit.rflags,
         },
         interruptible: exit.rflags & RFLAGS_IF != 0 && !blocked,
+        vp,
         instruction_length: exit.instruction_length_cr8 & 0x0f,
         rax,
     })
@@ -696,6 +712,7 @@ impl Partition<'_> {
     ) -> Result<()> {
         let data = flat_segment(SELECTOR_DATA, SEGMENT_DATA_ATTRIBUTES);
         self.set_registers(
+            0,
             &[
                 REG_GDTR, REG_CS, REG_DS, REG_ES, REG_SS, REG_FS, REG_GS, REG_CR0, REG_RIP,
                 REG_RFLAGS, REG_RSI,
@@ -718,12 +735,13 @@ impl Partition<'_> {
 
     pub(crate) fn skip_instruction(&self, info: &ExitInfo) -> Result<()> {
         let rip = info.cpu.rip + u64::from(info.instruction_length);
-        self.set_registers(&[REG_RIP], &[RegisterValue([rip, 0])])
+        self.set_registers(info.vp, &[REG_RIP], &[RegisterValue([rip, 0])])
     }
 
     pub(crate) fn finish_port_read(&self, info: &ExitInfo, size: u8, value: u32) -> Result<()> {
         let rip = info.cpu.rip + u64::from(info.instruction_length);
         self.set_registers(
+            info.vp,
             &[REG_RAX, REG_RIP],
             &[
                 RegisterValue([merge_rax(info.rax, size, value), 0]),
@@ -733,8 +751,8 @@ impl Partition<'_> {
     }
 
     /// Reads general register `index`, numbered as x86 encodes them.
-    pub(crate) fn general_register(&self, index: u8) -> Result<u64> {
-        Ok(self.register(u32::from(index))?.0[0])
+    pub(crate) fn general_register(&self, vp: u32, index: u8) -> Result<u64> {
+        Ok(self.register(vp, u32::from(index))?.0[0])
     }
 
     /// Finishes a device load: stores `value` and moves past `length` bytes.
@@ -751,10 +769,11 @@ impl Partition<'_> {
         let merged = if zero_extend {
             u64::from(value)
         } else {
-            merge_rax(self.general_register(index)?, size, value)
+            merge_rax(self.general_register(info.vp, index)?, size, value)
         };
         let rip = info.cpu.rip + u64::from(length);
         self.set_registers(
+            info.vp,
             &[name, REG_RIP],
             &[RegisterValue([merged, 0]), RegisterValue([rip, 0])],
         )
@@ -763,19 +782,23 @@ impl Partition<'_> {
     /// Moves past `length` bytes, for an instruction RAX decoded itself.
     pub(crate) fn advance(&self, info: &ExitInfo, length: u8) -> Result<()> {
         let rip = info.cpu.rip + u64::from(length);
-        self.set_registers(&[REG_RIP], &[RegisterValue([rip, 0])])
+        self.set_registers(info.vp, &[REG_RIP], &[RegisterValue([rip, 0])])
     }
 
     pub(crate) fn inject_interrupt(&self, vector: u8) -> Result<()> {
         // WHV_X64_PENDING_INTERRUPTION_REGISTER: pending bit, type 0
         // (external interrupt), vector at bit 16.
         let pending = 1 | u64::from(vector) << 16;
-        self.set_registers(&[REG_PENDING_INTERRUPTION], &[RegisterValue([pending, 0])])
+        self.set_registers(
+            0,
+            &[REG_PENDING_INTERRUPTION],
+            &[RegisterValue([pending, 0])],
+        )
     }
 
     pub(crate) fn request_interrupt_window(&self) -> Result<()> {
         // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: InterruptNotification.
-        self.set_registers(&[REG_DELIVERABILITY], &[RegisterValue([1 << 1, 0])])
+        self.set_registers(0, &[REG_DELIVERABILITY], &[RegisterValue([1 << 1, 0])])
     }
 
     pub(crate) fn cancel_parts(
@@ -824,10 +847,11 @@ pub fn measure_exit_latency(api: &Api, iterations: usize) -> Result<ExitLatency>
 
     // Keep the reset value of CS, including its attributes, and rebase it to
     // zero so that IP is the guest physical address in real mode.
-    let mut cs = partition.register(REG_CS)?;
+    let mut cs = partition.register(0, REG_CS)?;
     cs.0[0] = 0;
     cs.0[1] &= !SEGMENT_SELECTOR_MASK;
     partition.set_registers(
+        0,
         &[REG_CS, REG_RIP, REG_RFLAGS],
         &[
             cs,
@@ -842,7 +866,7 @@ pub fn measure_exit_latency(api: &Api, iterations: usize) -> Result<ExitLatency>
     let started = Instant::now();
     for _ in 0..iterations {
         let before = Instant::now();
-        partition.run(&mut exit)?;
+        partition.run(0, &mut exit)?;
         let elapsed = before.elapsed();
         if exit.reason != EXIT_IO_PORT {
             return Err(Error::UnexpectedExit {
@@ -852,7 +876,7 @@ pub fn measure_exit_latency(api: &Api, iterations: usize) -> Result<ExitLatency>
         }
         samples.push(u32::try_from(elapsed.as_nanos()).unwrap_or(u32::MAX));
         let length = u64::from(exit.instruction_length_cr8 & 0x0f);
-        partition.set_registers(&[REG_RIP], &[RegisterValue([exit.rip + length, 0])])?;
+        partition.set_registers(0, &[REG_RIP], &[RegisterValue([exit.rip + length, 0])])?;
     }
     let total = started.elapsed();
     let mean_full_exit_cycle_ns = total.as_nanos() as f64 / iterations.max(1) as f64;

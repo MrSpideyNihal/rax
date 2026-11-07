@@ -18,6 +18,7 @@ pub struct Vm<'a> {
     // Declared first so the partition is deleted before its RAM is released.
     partition: Partition<'a>,
     ram: GuestRegion,
+    cpus: u32,
     /// One page of `0xFF`, mapped wherever the guest probes absent hardware.
     floating_page: GuestRegion,
     framebuffer: Option<GuestRegion>,
@@ -26,21 +27,32 @@ pub struct Vm<'a> {
 impl<'a> Vm<'a> {
     /// Creates the machine and maps `ram_bytes` of zeroed RAM.
     pub fn new(api: &'a Api, ram_bytes: usize) -> Result<Self> {
-        Self::with_local_apic(api, ram_bytes, false)
+        Self::with_local_apic(api, ram_bytes, 1, false)
     }
 
-    /// Creates the machine, optionally with the hypervisor emulating the
-    /// local APIC.
-    pub fn with_local_apic(api: &'a Api, ram_bytes: usize, local_apic: bool) -> Result<Self> {
+    /// Creates the machine with `cpus` CPUs, optionally with the hypervisor
+    /// emulating the local APIC, which more than one CPU needs.
+    pub fn with_local_apic(
+        api: &'a Api,
+        ram_bytes: usize,
+        cpus: u32,
+        local_apic: bool,
+    ) -> Result<Self> {
         let ram = GuestRegion::new(ram_bytes)?;
-        let partition = Partition::with_local_apic(api, 1, local_apic)?;
+        let partition = Partition::with_local_apic(api, cpus, local_apic)?;
         map_guest_ram(&partition, &ram)?;
-        partition.create_processor(0)?;
+        for vp in 0..cpus {
+            partition.create_processor(vp)?;
+            if vp > 0 {
+                partition.hold_for_startup(vp)?;
+            }
+        }
         let floating_page = GuestRegion::new(PAGE)?;
         floating_page.write_at(0, &[0xff; PAGE])?;
         Ok(Self {
             partition,
             ram,
+            cpus,
             floating_page,
             framebuffer: None,
         })
@@ -113,9 +125,9 @@ impl<'a> Vm<'a> {
             .enter_protected_mode(entry, rsi, gdt_gpa, gdt_bytes)
     }
 
-    /// Runs the vCPU until the next exit.
-    pub fn run(&self) -> Result<ExitInfo> {
-        read_exit(&self.partition)
+    /// Runs a vCPU until its next exit. Each vCPU belongs to one thread.
+    pub fn run(&self, vp: u32) -> Result<ExitInfo> {
+        read_exit(&self.partition, vp)
     }
 
     /// Completes a port read by storing `value` in the low `size` bytes of
@@ -129,9 +141,9 @@ impl<'a> Vm<'a> {
         self.partition.skip_instruction(info)
     }
 
-    /// Reads general register `index`, numbered as x86 encodes them.
-    pub fn general_register(&self, index: u8) -> Result<u64> {
-        self.partition.general_register(index)
+    /// Reads general register `index` of a vCPU, numbered as x86 encodes them.
+    pub fn general_register(&self, vp: u32, index: u8) -> Result<u64> {
+        self.partition.general_register(vp, index)
     }
 
     /// Finishes a decoded device load.
@@ -181,6 +193,7 @@ impl<'a> Vm<'a> {
         Kicker {
             cancel,
             handle,
+            cpus: self.cpus,
             _vm: PhantomData,
         }
     }
@@ -252,6 +265,7 @@ impl Interrupter<'_> {
 pub struct Kicker<'a> {
     cancel: unsafe extern "system" fn(Handle, u32, u32) -> i32,
     handle: Handle,
+    cpus: u32,
     _vm: PhantomData<&'a ()>,
 }
 
@@ -268,6 +282,14 @@ impl Kicker<'_> {
     pub fn kick(&self) {
         // SAFETY: the partition outlives `self`, and vCPU 0 always exists.
         let _ = unsafe { (self.cancel)(self.handle, 0, 0) };
+    }
+
+    /// Requests an exit from every vCPU.
+    pub fn kick_all(&self) {
+        for vp in 0..self.cpus {
+            // SAFETY: the partition outlives `self`, and these vCPUs exist.
+            let _ = unsafe { (self.cancel)(self.handle, vp, 0) };
+        }
     }
 }
 

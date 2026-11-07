@@ -269,6 +269,7 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         gpu: options.gpu.as_ref().map(PathBuf::from),
         balloon: options.balloon,
         apic: options.apic,
+        cpus: options.cpus,
         screenshot: options.screenshot.as_ref().map(PathBuf::from),
         network: options.network.then(rax_net::host::Network::start),
         touchscreen: options.touch_script.is_some(),

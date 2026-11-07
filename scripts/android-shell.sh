@@ -20,7 +20,7 @@ fi
 
 # APIC=1 uses the hypervisor's local APIC and RAX's I/O APIC.
 if [ -n "${APIC:-}" ]; then
-    interrupts="no_timer_check nr_cpus=1"
+    interrupts="no_timer_check nr_cpus=${CPUS:-1}"
 else
     interrupts="nolapic noapic nosmp"
 fi
@@ -44,7 +44,7 @@ timeout=$((wait_secs + (lines + 2) * step_secs + 10 + ${EXTRA_SECS:-0}))
 ) | ./target/release/rax.exe vm run --shell --kernel guest/kernel \
     --initrd guest/initrd.img --disk guest/android-x86_64-9.0-r2.iso \
     --ram-mib "$ram_mib" --timeout-secs "$timeout" --cmdline "$cmdline" \
-    ${NET:+--net} ${GPU:+--gpu "$GPU"} ${BALLOON:+--balloon} ${APIC:+--apic} --framebuffer "${SCREEN:-1280x720}" \
+    ${NET:+--net} ${GPU:+--gpu "$GPU"} ${BALLOON:+--balloon} ${APIC:+--apic} ${CPUS:+--cpus "$CPUS"} --framebuffer "${SCREEN:-1280x720}" \
     --screenshot "$log.bmp" \
     --report "$log.json" > "$log" 2>&1
 echo "exit $?"

@@ -69,7 +69,9 @@ const SOFTWARE_GRAPHICS: &str = "nomodeset HWACCEL=0";
 /// The 8259 interrupt controller, for the short run that formats the disk.
 const LEGACY_INTERRUPTS: &str = "nolapic noapic nosmp";
 /// The hypervisor's local APIC and RAX's I/O APIC, which cost far fewer exits.
-const APIC_INTERRUPTS: &str = "no_timer_check nr_cpus=1";
+const APIC_INTERRUPTS: &str = "no_timer_check nr_cpus=4";
+/// CPUs for a session. Must match `nr_cpus` above.
+const SESSION_CPUS: u8 = 4;
 /// The folder `scripts/fetch-gpu.ps1` fills.
 const GPU_FOLDER: &str = "gpu";
 const GPU_LIBRARY: &str = "libvirglrenderer-1.dll";
@@ -199,6 +201,7 @@ fn android_config(
         gpu: None,
         balloon: false,
         apic: false,
+        cpus: 1,
         screenshot: None,
         network: None,
         touchscreen: false,
@@ -414,6 +417,7 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     config.framebuffer = Some(screen);
     config.gpu = gpu_folder(root);
     config.apic = true;
+    config.cpus = SESSION_CPUS;
     config.own_init_cmdline = Some(android_cmdline("vdb", config.gpu.is_some(), true));
     config.network = Some(Network::start());
     config.touchscreen = true;
@@ -732,6 +736,11 @@ mod tests {
         assert!(android_cmdline("vdb", false, true).contains("nomodeset HWACCEL=0"));
         let gpu = android_cmdline("vdb", true, true);
         assert!(!gpu.contains("nomodeset") && !gpu.contains("HWACCEL"));
+    }
+
+    #[test]
+    fn the_command_line_and_the_machine_agree_on_cpus() {
+        assert!(APIC_INTERRUPTS.contains(&format!("nr_cpus={SESSION_CPUS}")));
     }
 
     #[test]

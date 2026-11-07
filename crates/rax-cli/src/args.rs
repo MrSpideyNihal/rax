@@ -6,6 +6,9 @@ const DEFAULT_VM_RAM_MIB: usize = 512;
 const DEFAULT_VM_TIMEOUT_SECS: usize = 60;
 
 /// A parsed invocation.
+/// The most CPUs the MP table and I/O APIC IDs leave room for.
+const MAX_CPUS: u8 = 14;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     /// Print the readiness report.
@@ -74,6 +77,8 @@ pub struct VmRun {
     pub balloon: bool,
     /// Uses the hypervisor's local APIC.
     pub apic: bool,
+    /// Virtual CPUs.
+    pub cpus: u8,
     /// File to save the screen to.
     pub screenshot: Option<String>,
     /// File of timed input for repeatable tests.
@@ -144,6 +149,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut gpu = None;
     let mut balloon = false;
     let mut apic = false;
+    let mut cpus = 1;
     let mut screenshot = None;
     let mut input_script = None;
     let mut network = false;
@@ -179,6 +185,13 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--cmdline" => cmdline = Some((*value).to_owned()),
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
             "--gpu" => gpu = Some((*value).to_owned()),
+            "--cpus" => {
+                cpus = value
+                    .parse()
+                    .ok()
+                    .filter(|count| (1..=MAX_CPUS).contains(count))
+                    .ok_or_else(|| format!("--cpus needs 1 to {MAX_CPUS}, got {value}"))?;
+            }
             "--screenshot" => screenshot = Some((*value).to_owned()),
             "--input-script" => input_script = Some((*value).to_owned()),
             "--touch-script" => touch_script = Some((*value).to_owned()),
@@ -198,6 +211,7 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         gpu,
         balloon,
         apic,
+        cpus,
         screenshot,
         input_script,
         network,
@@ -310,6 +324,7 @@ mod tests {
                 gpu: None,
                 balloon: false,
                 apic: false,
+                cpus: 1,
                 screenshot: None,
                 input_script: None,
                 network: false,
