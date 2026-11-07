@@ -1,11 +1,14 @@
 //! Run-time loading of system DLLs.
 
 use std::ffi::{CStr, c_void};
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::{Error, Result};
 
 const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -48,6 +51,38 @@ impl Library {
                 let code = unsafe { GetLastError() };
                 Error::LibraryMissing {
                     library: name.to_owned(),
+                    code,
+                }
+            })
+    }
+
+    /// Loads a DLL by full path. Its dependencies are looked for beside it.
+    pub fn load_from(path: &Path) -> Result<Self> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let name = path.display().to_string();
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the
+        // call, and a null file handle is the documented value for this API.
+        let raw = unsafe {
+            LoadLibraryExW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_WITH_ALTERED_SEARCH_PATH,
+            )
+        };
+        NonNull::new(raw)
+            .map(|handle| Self {
+                handle,
+                name: name.clone(),
+            })
+            .ok_or_else(|| {
+                // SAFETY: GetLastError has no preconditions.
+                let code = unsafe { GetLastError() };
+                Error::LibraryMissing {
+                    library: name,
                     code,
                 }
             })

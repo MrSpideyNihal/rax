@@ -4,10 +4,12 @@
 //! hypervisor is exposed here as a small safe interface.
 
 use std::marker::PhantomData;
+use std::path::Path;
 
+use crate::virgl::Renderer;
 use crate::whp::{
-    Api, ExitInfo, GuestRegion, Handle, PAGE, Partition, map_guest_memory, map_guest_ram,
-    map_read_only, read_exit,
+    Api, ExitInfo, GuestRegion, Handle, InterruptControl, PAGE, Partition, discard_pages,
+    map_guest_memory, map_guest_ram, map_read_only, read_exit,
 };
 use crate::{Error, Result};
 
@@ -16,6 +18,7 @@ pub struct Vm<'a> {
     // Declared first so the partition is deleted before its RAM is released.
     partition: Partition<'a>,
     ram: GuestRegion,
+    cpus: u32,
     /// One page of `0xFF`, mapped wherever the guest probes absent hardware.
     floating_page: GuestRegion,
     framebuffer: Option<GuestRegion>,
@@ -24,15 +27,32 @@ pub struct Vm<'a> {
 impl<'a> Vm<'a> {
     /// Creates the machine and maps `ram_bytes` of zeroed RAM.
     pub fn new(api: &'a Api, ram_bytes: usize) -> Result<Self> {
+        Self::with_local_apic(api, ram_bytes, 1, false)
+    }
+
+    /// Creates the machine with `cpus` CPUs, optionally with the hypervisor
+    /// emulating the local APIC, which more than one CPU needs.
+    pub fn with_local_apic(
+        api: &'a Api,
+        ram_bytes: usize,
+        cpus: u32,
+        local_apic: bool,
+    ) -> Result<Self> {
         let ram = GuestRegion::new(ram_bytes)?;
-        let partition = Partition::new(api, 1)?;
+        let partition = Partition::with_local_apic(api, cpus, local_apic)?;
         map_guest_ram(&partition, &ram)?;
-        partition.create_processor(0)?;
+        for vp in 0..cpus {
+            partition.create_processor(vp)?;
+            if vp > 0 {
+                partition.hold_for_startup(vp)?;
+            }
+        }
         let floating_page = GuestRegion::new(PAGE)?;
         floating_page.write_at(0, &[0xff; PAGE])?;
         Ok(Self {
             partition,
             ram,
+            cpus,
             floating_page,
             framebuffer: None,
         })
@@ -64,6 +84,24 @@ impl<'a> Vm<'a> {
         self.ram.read_at(gpa, buffer)
     }
 
+    /// A handle another thread uses to give guest RAM back to Windows.
+    #[must_use]
+    pub fn ram_releaser(&self) -> RamReleaser<'_> {
+        let (ram, size) = self.ram.raw_parts();
+        RamReleaser {
+            ram,
+            size,
+            _vm: PhantomData,
+        }
+    }
+
+    /// Starts the GPU renderer from `folder`. It may only use guest RAM while
+    /// the vCPU is stopped, and must stay on this thread.
+    pub fn start_renderer(&self, folder: &Path) -> Result<Renderer<'_>> {
+        let (ram, size) = self.ram.raw_parts();
+        Renderer::start(folder, ram, size)
+    }
+
     /// Makes reads of the page holding `gpa` return all ones, as reads of an
     /// unclaimed address do on a physical bus. Writes there still exit.
     pub fn map_floating_page(&self, gpa: u64) -> Result<()> {
@@ -87,9 +125,9 @@ impl<'a> Vm<'a> {
             .enter_protected_mode(entry, rsi, gdt_gpa, gdt_bytes)
     }
 
-    /// Runs the vCPU until the next exit.
-    pub fn run(&self) -> Result<ExitInfo> {
-        read_exit(&self.partition)
+    /// Runs a vCPU until its next exit. Each vCPU belongs to one thread.
+    pub fn run(&self, vp: u32) -> Result<ExitInfo> {
+        read_exit(&self.partition, vp)
     }
 
     /// Completes a port read by storing `value` in the low `size` bytes of
@@ -103,9 +141,9 @@ impl<'a> Vm<'a> {
         self.partition.skip_instruction(info)
     }
 
-    /// Reads general register `index`, numbered as x86 encodes them.
-    pub fn general_register(&self, index: u8) -> Result<u64> {
-        self.partition.general_register(index)
+    /// Reads general register `index` of a vCPU, numbered as x86 encodes them.
+    pub fn general_register(&self, vp: u32, index: u8) -> Result<u64> {
+        self.partition.general_register(vp, index)
     }
 
     /// Finishes a decoded device load.
@@ -137,6 +175,17 @@ impl<'a> Vm<'a> {
         self.partition.request_interrupt_window()
     }
 
+    /// A handle other threads use to send interrupts to the local APICs.
+    #[must_use]
+    pub fn interrupter(&self) -> Interrupter<'_> {
+        let (request, handle) = self.partition.interrupt_parts();
+        Interrupter {
+            request,
+            handle,
+            _vm: PhantomData,
+        }
+    }
+
     /// A handle other threads use to stop the vCPU.
     #[must_use]
     pub fn kicker(&self) -> Kicker<'_> {
@@ -144,7 +193,70 @@ impl<'a> Vm<'a> {
         Kicker {
             cancel,
             handle,
+            cpus: self.cpus,
             _vm: PhantomData,
+        }
+    }
+}
+
+/// Gives guest RAM back to Windows from any thread. Borrowing the `Vm` keeps
+/// the RAM alive.
+pub struct RamReleaser<'a> {
+    ram: *mut u8,
+    size: usize,
+    _vm: PhantomData<&'a ()>,
+}
+
+// SAFETY: the pointer is only passed to DiscardVirtualMemory, which any
+// thread may call, and the lifetime keeps the allocation alive.
+unsafe impl Send for RamReleaser<'_> {}
+// SAFETY: as above. The call needs no synchronisation on the caller's side.
+unsafe impl Sync for RamReleaser<'_> {}
+
+impl RamReleaser<'_> {
+    /// Discards guest RAM the guest has given up.
+    pub fn discard(&self, gpa: u64, length: usize) -> Result<()> {
+        // SAFETY: `ram` and `size` describe the Vm's RAM, which the lifetime
+        // keeps alive for as long as this handle exists.
+        unsafe { discard_pages(self.ram, self.size, gpa, length) }
+    }
+}
+
+/// Sends interrupts to the local APICs from any thread. Borrowing the `Vm`
+/// keeps the partition alive.
+pub struct Interrupter<'a> {
+    request: unsafe extern "system" fn(Handle, *const InterruptControl, u32) -> i32,
+    handle: Handle,
+    _vm: PhantomData<&'a ()>,
+}
+
+// SAFETY: `handle` is only passed to WHvRequestInterrupt, which exists to be
+// called from device threads. The lifetime keeps the partition alive.
+unsafe impl Send for Interrupter<'_> {}
+// SAFETY: as above. The call needs no synchronisation on the caller's side.
+unsafe impl Sync for Interrupter<'_> {}
+
+impl Interrupter<'_> {
+    /// Sends an edge-triggered interrupt. Failure means the guest loses this
+    /// interrupt, which only the hypervisor can explain, so it is reported.
+    pub fn send(&self, vector: u8, destination: u8, logical: bool, lowest: bool) -> Result<()> {
+        let control = InterruptControl::edge(vector, destination, logical, lowest);
+        // SAFETY: the partition outlives `self`, and `control` is a valid
+        // WHV_INTERRUPT_CONTROL of the size passed.
+        let code = unsafe {
+            (self.request)(
+                self.handle,
+                &raw const control,
+                size_of::<InterruptControl>() as u32,
+            )
+        };
+        if code < 0 {
+            Err(Error::Hresult {
+                api: "WHvRequestInterrupt",
+                code,
+            })
+        } else {
+            Ok(())
         }
     }
 }
@@ -153,6 +265,7 @@ impl<'a> Vm<'a> {
 pub struct Kicker<'a> {
     cancel: unsafe extern "system" fn(Handle, u32, u32) -> i32,
     handle: Handle,
+    cpus: u32,
     _vm: PhantomData<&'a ()>,
 }
 
@@ -170,7 +283,24 @@ impl Kicker<'_> {
         // SAFETY: the partition outlives `self`, and vCPU 0 always exists.
         let _ = unsafe { (self.cancel)(self.handle, 0, 0) };
     }
+
+    /// Requests an exit from every vCPU.
+    pub fn kick_all(&self) {
+        for vp in 0..self.cpus {
+            // SAFETY: the partition outlives `self`, and these vCPUs exist.
+            let _ = unsafe { (self.cancel)(self.handle, vp, 0) };
+        }
+    }
 }
+
+// SAFETY: every WHP call here is made for use from device and vCPU threads.
+// Guest RAM is plain bytes reached only through raw copies, and the guest can
+// change it at any moment anyway, so concurrent access cannot break a Rust
+// reference. Device rings order their own accesses, as they do on real
+// hardware.
+unsafe impl Sync for Vm<'_> {}
+// SAFETY: as above. Nothing in `Vm` is tied to the thread that created it.
+unsafe impl Send for Vm<'_> {}
 
 /// Reads the processor clock in hertz, when the hypervisor reports one.
 pub fn tsc_hz(api: &Api) -> Option<u64> {

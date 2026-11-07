@@ -28,6 +28,11 @@ New-Item -ItemType Directory -Force -Path "$Out/profiles" | Out-Null
 Copy-Item assets/profiles/*.json "$Out/profiles"
 Copy-Item LICENSE "$Out/LICENSE.txt"
 Copy-Item guest/kernel, guest/initrd.img, guest/android-x86_64-9.0-r2.iso "$Out/guest"
+# Without these DLLs RAX still runs, but Android draws in software.
+if (Test-Path gpu/libvirglrenderer-1.dll) {
+    New-Item -ItemType Directory -Force -Path "$Out/gpu" | Out-Null
+    Copy-Item gpu/*.dll "$Out/gpu"
+}
 @'
 RAX
 

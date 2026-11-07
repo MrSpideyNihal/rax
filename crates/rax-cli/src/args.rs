@@ -6,6 +6,9 @@ const DEFAULT_VM_RAM_MIB: usize = 512;
 const DEFAULT_VM_TIMEOUT_SECS: usize = 60;
 
 /// A parsed invocation.
+/// The most CPUs the MP table and I/O APIC IDs leave room for.
+const MAX_CPUS: u8 = 14;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     /// Print the readiness report.
@@ -23,11 +26,16 @@ pub enum Command {
         out: Option<String>,
     },
     /// Boot a Linux guest.
-    VmRun(VmRun),
+    VmRun(Box<VmRun>),
     /// Check a key-mapping profile.
     InputCheck {
         /// Path to the profile.
         profile: String,
+    },
+    /// Start virglrenderer and report what it can do.
+    GpuProbe {
+        /// Folder holding the renderer DLLs.
+        folder: String,
     },
     /// Open the launcher.
     Launch,
@@ -63,6 +71,14 @@ pub struct VmRun {
     pub cmdline: Option<String>,
     /// Screen size, as `(width, height)`.
     pub framebuffer: Option<(u16, u16)>,
+    /// Folder holding virglrenderer, which turns on the GPU.
+    pub gpu: Option<String>,
+    /// Lets the guest give unused RAM back.
+    pub balloon: bool,
+    /// Uses the hypervisor's local APIC.
+    pub apic: bool,
+    /// Virtual CPUs.
+    pub cpus: u8,
     /// File to save the screen to.
     pub screenshot: Option<String>,
     /// File of timed input for repeatable tests.
@@ -79,6 +95,9 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     match words.as_slice() {
         [] => Ok(Command::Launch),
         ["help" | "-h" | "--help"] => Ok(Command::Help),
+        ["gpu", "probe", folder] => Ok(Command::GpuProbe {
+            folder: (*folder).to_owned(),
+        }),
         ["ui", "preview", out] => Ok(Command::UiPreview {
             out: (*out).to_owned(),
         }),
@@ -127,6 +146,10 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     let mut disks = Vec::new();
     let mut cmdline = None;
     let mut framebuffer = None;
+    let mut gpu = None;
+    let mut balloon = false;
+    let mut apic = false;
+    let mut cpus = 1;
     let mut screenshot = None;
     let mut input_script = None;
     let mut network = false;
@@ -135,6 +158,14 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
     while let Some(option) = rest.next() {
         if *option == "--shell" {
             shell = true;
+            continue;
+        }
+        if *option == "--apic" {
+            apic = true;
+            continue;
+        }
+        if *option == "--balloon" {
+            balloon = true;
             continue;
         }
         if *option == "--net" {
@@ -153,13 +184,21 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
             "--disk" => disks.push((*value).to_owned()),
             "--cmdline" => cmdline = Some((*value).to_owned()),
             "--framebuffer" => framebuffer = Some(screen_size(value)?),
+            "--gpu" => gpu = Some((*value).to_owned()),
+            "--cpus" => {
+                cpus = value
+                    .parse()
+                    .ok()
+                    .filter(|count| (1..=MAX_CPUS).contains(count))
+                    .ok_or_else(|| format!("--cpus needs 1 to {MAX_CPUS}, got {value}"))?;
+            }
             "--screenshot" => screenshot = Some((*value).to_owned()),
             "--input-script" => input_script = Some((*value).to_owned()),
             "--touch-script" => touch_script = Some((*value).to_owned()),
             other => return Err(format!("unknown option: {other}")),
         }
     }
-    Ok(Command::VmRun(VmRun {
+    Ok(Command::VmRun(Box::new(VmRun {
         kernel: kernel.ok_or("--kernel is required")?,
         initrd: initrd.ok_or("--initrd is required")?,
         ram_mib,
@@ -169,11 +208,15 @@ fn parse_vm_run(options: &[&str]) -> Result<Command, String> {
         disks,
         cmdline,
         framebuffer,
+        gpu,
+        balloon,
+        apic,
+        cpus,
         screenshot,
         input_script,
         network,
         touch_script,
-    }))
+    })))
 }
 
 fn screen_size(value: &str) -> Result<(u16, u16), String> {
@@ -268,7 +311,7 @@ mod tests {
                 "--ram-mib",
                 "256"
             ]),
-            Ok(Command::VmRun(VmRun {
+            Ok(Command::VmRun(Box::new(VmRun {
                 kernel: "k".to_owned(),
                 initrd: "i".to_owned(),
                 ram_mib: 256,
@@ -278,11 +321,15 @@ mod tests {
                 disks: Vec::new(),
                 cmdline: None,
                 framebuffer: None,
+                gpu: None,
+                balloon: false,
+                apic: false,
+                cpus: 1,
                 screenshot: None,
                 input_script: None,
                 network: false,
                 touch_script: None,
-            }))
+            })))
         );
     }
 

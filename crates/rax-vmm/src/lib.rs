@@ -10,15 +10,20 @@ pub mod boot;
 pub mod bus;
 pub mod cpio;
 pub mod framebuffer;
+pub mod ioapic;
 pub mod mmio;
+pub mod mptable;
 pub mod pci;
 pub mod pic;
 pub mod pit;
 pub mod ps2;
 pub mod rtc;
 pub mod serial;
+pub mod virtio_balloon;
 pub mod virtio_blk;
+pub mod virtio_gpu;
 pub mod virtio_input;
+pub mod virtio_modern;
 pub mod virtio_net;
 
 #[cfg(windows)]

@@ -10,10 +10,17 @@ passes=${2:-3}
 ram_mib=${3:-2048}
 mkdir -p "$session"
 
+# GPU=folder boots on the virtio GPU, which needs kernel mode setting.
+if [ -n "${GPU:-}" ]; then
+    graphics=""
+else
+    graphics="nomodeset HWACCEL=0"
+fi
+
 cmdline="console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
 i8042.noaux tsc=reliable tsc_early_khz=3194043 \
 androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
-androidboot.selinux=permissive nomodeset HWACCEL=0 SRC= DATA= DEBUG="
+androidboot.selinux=permissive $graphics SRC= DATA= DEBUG="
 
 probe='while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 1; done; echo BOOT_DONE_$(cut -d. -f1 /proc/uptime); reboot -p'
 
@@ -25,7 +32,8 @@ while [ "$pass" -le "$passes" ]; do
     (sleep 8; printf '%s\n' "$probe"; sleep 1) | ./target/release/rax.exe vm run \
         --shell --kernel guest/kernel --initrd guest/initrd.img \
         --disk guest/android-x86_64-9.0-r2.iso --ram-mib "$ram_mib" \
-        --framebuffer 1280x720 --timeout-secs 180 --cmdline "$cmdline" \
+        ${GPU:+--gpu "$GPU"} --framebuffer 1280x720 --timeout-secs 180 \
+        --cmdline "$cmdline" \
         --report "$session/boot-$pass.json" > "$log" 2>&1
     seconds=$(grep -a -o -E '^BOOT_DONE_[0-9]+' "$log" | head -n 1 | sed 's/BOOT_DONE_//')
     echo "pass $pass: boot_completed at ${seconds:-never} s"

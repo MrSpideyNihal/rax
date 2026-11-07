@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "benchmark": "vm-boot",
+  "rax_version": "0.1.0",
+  "profile": "release",
+  "captured_at_unix": 1793986145,
+  "host": {
+    "cpu": "AMD Ryzen 7 7445HS w/ Radeon 740M Graphics",
+    "logical_cpus": 12,
+    "total_ram_mib": 15636,
+    "available_ram_mib": 4924,
+    "windows_version": "10.0.26300"
+  },
+  "run": {
+    "outcome": "powered_off",
+    "ram_mib": 2048,
+    "boot_to_user_space_ms": null,
+    "total_ms": 34773.5049,
+    "vcpu_exits": 329745,
+    "interrupts": 34691,
+    "floating_pages": 0,
+    "interrupt_window_exits": 2640,
+    "io": {
+      "serial": 37394,
+      "timer": 48756,
+      "clock": 117,
+      "interrupt_controller": 138842,
+      "pci": 950,
+      "disk": 19887,
+      "disk_requests": 8187,
+      "frames_in": 0,
+      "frames_out": 0,
+      "unclaimed": 42992
+    },
+    "unclaimed_ports": [
+      [
+        128,
+        42969
+      ],
+      [
+        745,
+        6
+      ],
+      [
+        761,
+        6
+      ],
+      [
+        1001,
+        6
+      ],
+      [
+        113,
+        3
+      ]
+    ],
+    "gpu": {
+      "commands": 3486,
+      "errors": 0,
+      "submits": 1562,
+      "flushes": 395
+    }
+  }
+}

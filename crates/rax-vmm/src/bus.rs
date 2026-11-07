@@ -4,12 +4,14 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::pci::{Pci, VIRTIO_IRQ};
+use crate::ioapic::{IOAPIC_GPA, IOAPIC_SIZE, Interrupt, IoApic};
+use crate::pci::{GPU_IRQ, Pci, VIRTIO_IRQ};
 use crate::pic::Pic;
 use crate::pit::Pit;
 use crate::ps2::{GuestInput, Ps2, Ps2Irq};
 use crate::rtc::Rtc;
 use crate::serial::{Serial, Sink};
+use crate::virtio_balloon::VirtioBalloon;
 use crate::virtio_blk::{GuestMemory, VirtioBlk};
 use crate::virtio_input::VirtioInput;
 use crate::virtio_net::VirtioNet;
@@ -21,6 +23,9 @@ const IRQ_CASCADE: u8 = 2;
 const IRQ_SERIAL: u8 = 4;
 /// The mouse line on the slave PIC, IRQ 12 overall.
 const SLAVE_IRQ_MOUSE: u8 = 4;
+const IRQ_MOUSE: u8 = 12;
+/// The I/O APIC line the timer uses, past the 8259's cascade.
+const IOAPIC_TIMER_PIN: u8 = 2;
 
 const PIC1_COMMAND: u16 = 0x20;
 const PIC1_DATA: u16 = 0x21;
@@ -65,6 +70,10 @@ pub struct IoStats {
     pub frames_in: u64,
     /// Frames sent by the guest.
     pub frames_out: u64,
+    /// Pages the balloon holds at the end of the run.
+    pub balloon_pages: u64,
+    /// Interrupts sent through the I/O APIC.
+    pub apic_interrupts: u64,
     /// Accesses to ports with no device.
     pub unclaimed: u64,
 }
@@ -73,6 +82,11 @@ pub struct IoStats {
 pub struct Bus {
     pic: Pic,
     slave_pic: Pic,
+    ioapic: Option<IoApic>,
+    /// The line the GPU uses.
+    gpu_irq: u8,
+    /// Interrupts ready for the local APICs.
+    outgoing: Vec<Interrupt>,
     pit: Pit,
     rtc: Rtc,
     wall_clock: fn() -> u64,
@@ -82,6 +96,7 @@ pub struct Bus {
     disks: Vec<VirtioBlk>,
     network: Option<VirtioNet>,
     touch: Option<VirtioInput>,
+    balloon: Option<VirtioBalloon>,
     reset_requested: bool,
     stats: IoStats,
     unclaimed_ports: BTreeMap<u16, u64>,
@@ -96,23 +111,80 @@ impl Bus {
         disks: Vec<VirtioBlk>,
         network: Option<VirtioNet>,
         touch: Option<VirtioInput>,
+        gpu: bool,
+        balloon: Option<VirtioBalloon>,
     ) -> Self {
         Self {
             pic: Pic::default(),
             slave_pic: Pic::default(),
+            ioapic: None,
+            gpu_irq: VIRTIO_IRQ,
+            outgoing: Vec::new(),
             pit: Pit::default(),
             rtc: Rtc::default(),
             wall_clock,
             serial: Serial::new(console),
             ps2: Ps2::default(),
-            pci: Pci::new(disks.len(), network.is_some(), touch.is_some()),
+            pci: Pci::new(
+                disks.len(),
+                network.is_some(),
+                touch.is_some(),
+                gpu,
+                balloon.is_some(),
+            ),
             disks,
             network,
             touch,
+            balloon,
             reset_requested: false,
             stats: IoStats::default(),
             unclaimed_ports: BTreeMap::new(),
         }
+    }
+
+    /// Adds an I/O APIC for guests that use the hypervisor's local APIC.
+    pub fn add_ioapic(&mut self, id: u8) {
+        self.ioapic = Some(IoApic::new(id));
+        self.pci.use_gpu_irq();
+        self.gpu_irq = GPU_IRQ;
+    }
+
+    fn raise(&mut self, irq: u8) {
+        // Lines 8 and up belong to the slave 8259, which only the I/O APIC path uses here.
+        if irq < 8 {
+            self.pic.raise(irq);
+        }
+        self.raise_ioapic(irq);
+    }
+
+    fn raise_ioapic(&mut self, irq: u8) {
+        let pin = if irq == IRQ_TIMER {
+            IOAPIC_TIMER_PIN
+        } else {
+            irq
+        };
+        if let Some(interrupt) = self
+            .ioapic
+            .as_mut()
+            .and_then(|apic| apic.raise(usize::from(pin)))
+        {
+            self.outgoing.push(interrupt);
+        }
+    }
+
+    /// Takes the interrupts waiting for the local APICs.
+    pub fn take_interrupts(&mut self) -> Vec<Interrupt> {
+        if self.outgoing.is_empty() {
+            return Vec::new();
+        }
+        self.stats.apic_interrupts += self.outgoing.len() as u64;
+        std::mem::take(&mut self.outgoing)
+    }
+
+    fn ioapic_offset(&self, gpa: u64) -> Option<u64> {
+        self.ioapic.as_ref()?;
+        let offset = gpa.checked_sub(IOAPIC_GPA)?;
+        (offset < IOAPIC_SIZE).then_some(offset)
     }
 
     /// Handles `in`.
@@ -301,19 +373,57 @@ impl Bus {
             screen.service(memory);
             raise |= screen.take_irq();
         }
+        if let Some(balloon) = self.balloon.as_mut() {
+            balloon.service(memory);
+            raise |= balloon.take_irq();
+            self.stats.balloon_pages = u64::from(balloon.pages_returned());
+        }
         if raise {
-            self.pic.raise(VIRTIO_IRQ);
+            self.raise(VIRTIO_IRQ);
+        }
+    }
+
+    /// Lets the balloon check the guest's spare memory. Call while the vCPU
+    /// is stopped.
+    pub fn poll_balloon(&mut self, now_ns: u64, memory: &dyn GuestMemory) {
+        if let Some(balloon) = self.balloon.as_mut() {
+            balloon.poll(now_ns, memory);
+            if balloon.take_irq() {
+                self.raise(VIRTIO_IRQ);
+            }
         }
     }
 
     /// Whether a memory address belongs to a device.
     #[must_use]
     pub fn owns_memory(&self, gpa: u64) -> bool {
-        self.pci.input_offset(gpa).is_some()
+        self.ioapic_offset(gpa).is_some()
+            || self.pci.input_offset(gpa).is_some()
+            || self.pci.gpu_offset(gpa).is_some()
+            || self.pci.balloon_offset(gpa).is_some()
+    }
+
+    /// Finds the GPU register a memory address belongs to. The GPU itself
+    /// lives on the vCPU thread, because OpenGL contexts cannot move.
+    #[must_use]
+    pub fn gpu_offset(&self, gpa: u64) -> Option<u64> {
+        self.pci.gpu_offset(gpa)
+    }
+
+    /// Raises the GPU's interrupt line.
+    pub fn raise_gpu(&mut self) {
+        self.raise(self.gpu_irq);
     }
 
     /// Handles a device memory load.
     pub fn memory_read(&mut self, gpa: u64, size: u8) -> u32 {
+        if let (Some(offset), Some(apic)) = (self.ioapic_offset(gpa), self.ioapic.as_ref()) {
+            return apic.read(offset);
+        }
+        if let (Some(offset), Some(balloon)) = (self.pci.balloon_offset(gpa), self.balloon.as_mut())
+        {
+            return balloon.read(offset, size);
+        }
         match (self.pci.input_offset(gpa), self.touch.as_mut()) {
             (Some(offset), Some(screen)) => screen.read(offset, size),
             _ => FLOATING_BUS,
@@ -322,6 +432,19 @@ impl Bus {
 
     /// Handles a device memory store.
     pub fn memory_write(&mut self, gpa: u64, value: u32) {
+        if let Some(offset) = self.ioapic_offset(gpa) {
+            let released = self
+                .ioapic
+                .as_mut()
+                .and_then(|apic| apic.write(offset, value));
+            self.outgoing.extend(released);
+            return;
+        }
+        if let (Some(offset), Some(balloon)) = (self.pci.balloon_offset(gpa), self.balloon.as_mut())
+        {
+            balloon.write(offset, value);
+            return;
+        }
         if let (Some(offset), Some(screen)) = (self.pci.input_offset(gpa), self.touch.as_mut()) {
             screen.write(offset, value);
         }
@@ -336,10 +459,11 @@ impl Bus {
 
     fn collect_ps2_irq(&mut self) {
         match self.ps2.take_irq() {
-            Some(Ps2Irq::Keyboard) => self.pic.raise(IRQ_KEYBOARD),
+            Some(Ps2Irq::Keyboard) => self.raise(IRQ_KEYBOARD),
             Some(Ps2Irq::Mouse) => {
                 self.slave_pic.raise(SLAVE_IRQ_MOUSE);
                 self.pic.raise(IRQ_CASCADE);
+                self.raise_ioapic(IRQ_MOUSE);
             }
             None => {}
         }
@@ -353,14 +477,14 @@ impl Bus {
 
     fn collect_serial_irq(&mut self) {
         if self.serial.take_irq() {
-            self.pic.raise(IRQ_SERIAL);
+            self.raise(IRQ_SERIAL);
         }
     }
 
     /// Advances time. Returns true if an interrupt is now waiting.
     pub fn tick(&mut self, now_ns: u64) -> bool {
         if self.pit.poll(now_ns) {
-            self.pic.raise(IRQ_TIMER);
+            self.raise(IRQ_TIMER);
         }
         self.pic.pending_vector().is_some()
     }
@@ -426,7 +550,15 @@ mod tests {
     fn bus() -> (Bus, Capture) {
         let capture = Capture::default();
         (
-            Bus::new(Box::new(capture.clone()), || 0, Vec::new(), None, None),
+            Bus::new(
+                Box::new(capture.clone()),
+                || 0,
+                Vec::new(),
+                None,
+                None,
+                false,
+                None,
+            ),
             capture,
         )
     }
@@ -546,6 +678,51 @@ mod tests {
         bus.write(0xa0, 1, 0x64, 0); // Slave EOI for its line 4.
         bus.write(0x20, 1, 0x62, 0); // Master EOI for the cascade.
         assert_eq!(bus.pending_vector(), None);
+    }
+
+    fn route_pin(bus: &mut Bus, pin: u32, vector: u32) {
+        bus.memory_write(IOAPIC_GPA, 0x10 + pin * 2);
+        bus.memory_write(IOAPIC_GPA + 0x10, vector);
+    }
+
+    #[test]
+    fn without_an_ioapic_its_address_is_not_claimed() {
+        let (bus, _) = bus();
+        assert!(!bus.owns_memory(IOAPIC_GPA));
+    }
+
+    #[test]
+    fn the_timer_reaches_the_ioapic_on_its_own_line() {
+        let (mut bus, _) = bus();
+        bus.add_ioapic(1);
+        route_pin(&mut bus, 2, 0x30);
+        bus.raise(IRQ_TIMER);
+        let sent = bus.take_interrupts();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].vector, 0x30);
+        assert_eq!(bus.stats().apic_interrupts, 1);
+    }
+
+    #[test]
+    fn the_mouse_reaches_line_12() {
+        let (mut bus, _) = bus();
+        bus.add_ioapic(1);
+        route_pin(&mut bus, 12, 0x3c);
+        bus.write(0x64, 1, 0x60, 0);
+        bus.write(0x60, 1, 0x03, 0);
+        bus.write(0x64, 1, 0xd4, 0);
+        bus.write(0x60, 1, 0xf4, 0);
+        assert_eq!(bus.take_interrupts()[0].vector, 0x3c);
+    }
+
+    #[test]
+    fn unmasking_releases_an_earlier_edge() {
+        let (mut bus, _) = bus();
+        bus.add_ioapic(1);
+        bus.raise_gpu();
+        assert!(bus.take_interrupts().is_empty());
+        route_pin(&mut bus, 11, 0x3b);
+        assert_eq!(bus.take_interrupts()[0].vector, 0x3b);
     }
 
     #[test]

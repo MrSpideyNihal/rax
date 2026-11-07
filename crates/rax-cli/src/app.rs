@@ -7,7 +7,7 @@ use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::apk::{self, InstallResult};
 use rax_host::window::{self, Button, Event, Window};
@@ -24,7 +24,9 @@ const INITRD: &str = "guest/initrd.img";
 const SYSTEM: &str = "guest/android-x86_64-9.0-r2.iso";
 /// Android's own data, which is what keeps apps between runs.
 const DATA: &str = "data.img";
-const DATA_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// The disk apps and games live on. It is sparse, so this is a limit, not a
+/// cost: the file only uses what Android has really written.
+const DATA_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Spare disk that carries an APK into Android during a session.
 const INBOX: &str = "inbox.tmp";
 /// A blank data disk is formatted by Android itself, at its console.
@@ -43,11 +45,79 @@ const RELEASE_SCANCODE: u8 = 0x1d;
 const GAME_MODE_SCANCODE: u8 = 0x58;
 const PROFILES: &str = "profiles";
 const BUILT_IN_PROFILE: &str = include_str!("../../../assets/profiles/example-shooter.json");
-const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, F12 game controls, drop an APK to install";
+const HINT: &str = "RAX - click to capture the mouse, Right Ctrl releases, F9 Home, F10 Back, F12 game controls, drop an APK to install";
+/// F9 and F10, which stand in for a phone's Home and Back buttons.
+const F9_SCANCODE: u8 = 0x43;
+const F10_SCANCODE: u8 = 0x44;
+/// The keyboard codes Linux reads as `KEY_HOMEPAGE` and `KEY_BACK`, which
+/// Android treats as its Home and Back buttons.
+const ANDROID_HOME: (u8, bool) = (0x32, true);
+const ANDROID_BACK: (u8, bool) = (0x6a, true);
 
-const ANDROID_CMDLINE: &str = "console=ttyS0 nolapic noapic acpi=off nosmp reboot=k panic=-1 \
+/// Turns the keys RAX reserves into the Android buttons they stand for.
+fn android_key(scancode: u8, extended: bool) -> (u8, bool) {
+    match (scancode, extended) {
+        (F9_SCANCODE, false) => ANDROID_HOME,
+        (F10_SCANCODE, false) => ANDROID_BACK,
+        other => other,
+    }
+}
+
+const ANDROID_CMDLINE: &str = "console=ttyS0 acpi=off reboot=k panic=-1 \
     tsc=reliable androidboot.hardware=android_x86_64 androidboot.console=ttyS0 \
-    androidboot.selinux=permissive nomodeset HWACCEL=0 VIRT_WIFI=0 SRC= DEBUG=";
+    androidboot.selinux=permissive VIRT_WIFI=0 SRC= DEBUG=";
+/// Keeps Android on the plain framebuffer.
+const SOFTWARE_GRAPHICS: &str = "nomodeset HWACCEL=0";
+/// The 8259 interrupt controller, for the short run that formats the disk.
+const LEGACY_INTERRUPTS: &str = "nolapic noapic nosmp";
+/// The hypervisor's local APIC and RAX's I/O APIC, which cost far fewer exits.
+const APIC_INTERRUPTS: &str = "no_timer_check nr_cpus=4";
+/// CPUs for a session. Must match `nr_cpus` above.
+const SESSION_CPUS: u8 = 4;
+/// The folder `scripts/fetch-gpu.ps1` fills.
+const GPU_FOLDER: &str = "gpu";
+const GPU_LIBRARY: &str = "libvirglrenderer-1.dll";
+/// The refresh rate Android is told its screen has. It paces frames to this,
+/// so at 60 the game stopped there with most of the machine idle.
+const REFRESH_HZ: u32 = 240;
+/// Typed into Android's console once it is up. Its 4.19 GPU driver copies each
+/// command batch into one continuous block, up to 256 KiB. Once memory
+/// fragments, that copy fails, the batch is lost, and a game waits forever for
+/// a query inside it. So this keeps memory free and regularly compacted. The
+/// marker file means typing it again does nothing, which is what lets RAX
+/// repeat it until the shell has really started.
+const MEMORY_TUNING: &[u8] = b"[ -e /dev/.rax ] || { : > /dev/.rax; \
+    echo 196608 > /proc/sys/vm/min_free_kbytes; \
+    (while true; do echo 1 > /proc/sys/vm/compact_memory; sleep 30; done) \
+    > /dev/null 2>&1 & }\n";
+/// How often that is typed, and how many times.
+const TUNING_INTERVAL: Duration = Duration::from_secs(15);
+const TUNING_TRIES: u32 = 6;
+/// How often the frame rate in the title bar updates.
+const TITLE_INTERVAL: Duration = Duration::from_secs(1);
+
+fn android_cmdline(data_arg: &str, gpu: bool, apic: bool) -> String {
+    let graphics = if gpu { "" } else { SOFTWARE_GRAPHICS };
+    let interrupts = if apic {
+        APIC_INTERRUPTS
+    } else {
+        LEGACY_INTERRUPTS
+    };
+    format!("{ANDROID_CMDLINE} {interrupts} {graphics} DATA={data_arg}")
+}
+
+/// Sets the screen's size and refresh rate on the kernel command line. The
+/// virtio GPU offers no way to report a rate, and only the kernel's built-in
+/// 60 Hz modes exist otherwise.
+fn screen_mode(width: u16, height: u16) -> String {
+    format!(" video=Virtual-1:{width}x{height}@{REFRESH_HZ}")
+}
+
+/// The renderer's folder, if this copy of RAX has one.
+fn gpu_folder(root: &Path) -> Option<PathBuf> {
+    let folder = root.join(GPU_FOLDER);
+    folder.join(GPU_LIBRARY).is_file().then_some(folder)
+}
 
 fn has_android(root: &Path) -> bool {
     [KERNEL, INITRD, SYSTEM]
@@ -153,8 +223,12 @@ fn android_config(
         shell: false,
         disks,
         init_script: None,
-        own_init_cmdline: Some(format!("{ANDROID_CMDLINE} DATA={data_arg}")),
+        own_init_cmdline: Some(android_cmdline(data_arg, false, false)),
         framebuffer: None,
+        gpu: None,
+        balloon: false,
+        apic: false,
+        cpus: 1,
         screenshot: None,
         network: None,
         touchscreen: false,
@@ -170,6 +244,8 @@ fn android_config(
 fn prepare_data_disk(window: &mut Window, root: &Path) -> Result<(), Box<dyn Error>> {
     let partial = root.join("data.tmp");
     let file = std::fs::File::create(&partial)?;
+    // On a disk without sparse files this still works, using the full size.
+    let _ = rax_host::sparse::mark_sparse(&file);
     file.set_len(DATA_BYTES)?;
     drop(file);
 
@@ -285,6 +361,9 @@ fn begin_install(path: &Path, inbox: &Path, display: &Display) -> Result<Install
     if bytes.len() as u64 > apk::INBOX_BYTES {
         return Err("That APK is larger than 1 GB".into());
     }
+    if apk::is_arm_only(&bytes) {
+        return Err(format!("{name} is ARM-only, and RAX can't run ARM apps yet").into());
+    }
     let mut file = std::fs::OpenOptions::new().write(true).open(inbox)?;
     file.write_all(&bytes)?;
     file.sync_data()?;
@@ -305,6 +384,8 @@ fn begin_install(path: &Path, inbox: &Path, display: &Display) -> Result<Install
 #[derive(Default)]
 struct InputState {
     buttons: u8,
+    /// Keys Android believes are down, as `(scancode, extended)`.
+    keys: Vec<(u8, bool)>,
 }
 
 impl InputState {
@@ -322,9 +403,75 @@ impl InputState {
         GuestInput::MouseButtons(self.buttons)
     }
 
-    /// Lifts held buttons, so nothing stays stuck after losing the mouse.
-    fn release(&mut self) -> Option<GuestInput> {
-        (std::mem::take(&mut self.buttons) != 0).then_some(GuestInput::MouseButtons(0))
+    fn key(&mut self, scancode: u8, extended: bool, down: bool) -> GuestInput {
+        let key = (scancode, extended);
+        self.keys.retain(|&held| held != key);
+        if down {
+            self.keys.push(key);
+        }
+        GuestInput::Key {
+            scancode,
+            extended,
+            down,
+        }
+    }
+
+    /// Lifts everything held. Windows sends no key-up to a window that lost
+    /// focus, so without this the Alt of an Alt+Tab stays down in Android,
+    /// and every letter typed after coming back becomes an Alt character.
+    fn release(&mut self) -> Vec<GuestInput> {
+        let keys = std::mem::take(&mut self.keys);
+        let mut lifted: Vec<GuestInput> = keys
+            .into_iter()
+            .map(|(scancode, extended)| GuestInput::Key {
+                scancode,
+                extended,
+                down: false,
+            })
+            .collect();
+        if std::mem::take(&mut self.buttons) != 0 {
+            lifted.push(GuestInput::MouseButtons(0));
+        }
+        lifted
+    }
+}
+
+/// A window into Android's console for diagnosing a live session. Set
+/// `RAX_CONSOLE_DIR`, and RAX appends the console to `console.log` there and
+/// types whatever appears in `console.in`, then deletes that file.
+struct ConsoleTap {
+    log: std::fs::File,
+    commands: PathBuf,
+    seen: usize,
+}
+
+impl ConsoleTap {
+    fn from_environment() -> Option<Self> {
+        let folder = PathBuf::from(std::env::var_os("RAX_CONSOLE_DIR")?);
+        std::fs::create_dir_all(&folder).ok()?;
+        let log = std::fs::File::create(folder.join("console.log")).ok()?;
+        Some(Self {
+            log,
+            commands: folder.join("console.in"),
+            seen: 0,
+        })
+    }
+
+    fn pump(&mut self, display: &Display) {
+        if let Ok(text) = display.console_output.lock() {
+            // The buffer drops old text when full, which restarts the count.
+            if text.len() < self.seen {
+                self.seen = 0;
+            }
+            let _ = self.log.write_all(&text.as_bytes()[self.seen..]);
+            self.seen = text.len();
+        }
+        if let Ok(commands) = std::fs::read(&self.commands) {
+            let _ = std::fs::remove_file(&self.commands);
+            if let Ok(mut typed) = display.console_input.lock() {
+                typed.extend_from_slice(&commands);
+            }
+        }
     }
 }
 
@@ -334,17 +481,33 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     let screen = Framebuffer { width, height };
     let display = Display::new(screen.size_bytes());
     let inbox = root.join(INBOX);
-    std::fs::File::create(&inbox)?.set_len(apk::INBOX_BYTES)?;
+    let inbox_file = std::fs::File::create(&inbox)?;
+    let _ = rax_host::sparse::mark_sparse(&inbox_file);
+    inbox_file.set_len(apk::INBOX_BYTES)?;
+    drop(inbox_file);
     let disks = vec![root.join(SYSTEM), root.join(DATA), inbox.clone()];
     let mut config = android_config(root, "vdb", disks)?;
     config.ram_mib = MEMORY_CHOICES_MIB[settings.memory];
     config.framebuffer = Some(screen);
+    config.gpu = gpu_folder(root);
+    config.apic = true;
+    config.cpus = SESSION_CPUS;
+    let mut cmdline = android_cmdline("vdb", config.gpu.is_some(), true);
+    if config.gpu.is_some() {
+        cmdline.push_str(&screen_mode(width, height));
+    }
+    config.own_init_cmdline = Some(cmdline);
     config.network = Some(Network::start());
     config.touchscreen = true;
     config.display = Some(display.clone());
 
-    window.set_title(HINT);
+    let mut title = HINT.to_owned();
     let guest = std::thread::spawn(move || machine::run(config).map_err(|error| error.to_string()));
+    let mut last_title = Instant::now();
+    let mut last_frames = 0;
+    let mut tap = ConsoleTap::from_environment();
+    let session_started = Instant::now();
+    let mut tuning_sent = 0;
     let mut input = InputState::default();
     let mut install: Option<Install> = None;
     let profile = load_profile(root)?;
@@ -368,12 +531,12 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                 if game_mode {
                     queued.extend(input.release());
                     window.set_capture(true);
-                    window.set_title(&format!(
+                    title.clone_from(&format!(
                         "RAX - game controls: {profile_name}. F12 to leave"
                     ));
                 } else {
                     touches.extend(mapper.handle(Input::FocusLost));
-                    window.set_title(HINT);
+                    title = HINT.to_owned();
                 }
                 continue;
             }
@@ -395,10 +558,10 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                 Event::Dropped(path) if install.is_none() => {
                     match begin_install(&path, &inbox, &display) {
                         Ok(started) => {
-                            window.set_title(&format!("RAX - installing {}...", started.name));
+                            title.clone_from(&format!("RAX - installing {}...", started.name));
                             install = Some(started);
                         }
-                        Err(error) => window.set_title(&format!("RAX - {error}")),
+                        Err(error) => title.clone_from(&format!("RAX - {error}")),
                     }
                 }
                 Event::Focus(false) => {
@@ -429,11 +592,10 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
                     extended,
                     down,
                     ..
-                } => queued.push(GuestInput::Key {
-                    scancode,
-                    extended,
-                    down,
-                }),
+                } => {
+                    let (scancode, extended) = android_key(scancode, extended);
+                    queued.push(input.key(scancode, extended, down));
+                }
                 _ => {}
             }
         }
@@ -450,12 +612,29 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
         if let Ok(frame) = display.frame.lock() {
             window.present(&frame, width, height);
         }
+        if last_title.elapsed() >= TITLE_INTERVAL {
+            let frames = display.frames.load(Ordering::Relaxed);
+            let rate =
+                frames.saturating_sub(last_frames) as f64 / last_title.elapsed().as_secs_f64();
+            window.set_title(&format!("{rate:.0} FPS - {title}"));
+            (last_frames, last_title) = (frames, Instant::now());
+        }
+        if let Some(tap) = tap.as_mut() {
+            tap.pump(&display);
+        }
+        if tuning_sent < TUNING_TRIES
+            && session_started.elapsed() >= TUNING_INTERVAL * (tuning_sent + 1)
+            && let Ok(mut typed) = display.console_input.lock()
+        {
+            typed.extend_from_slice(MEMORY_TUNING);
+            tuning_sent += 1;
+        }
         let finished = install.as_ref().and_then(|_| {
             let text = display.console_output.lock().ok()?;
             apk::parse_result(&text)
         });
         if let (Some(result), Some(done)) = (finished, &install) {
-            window.set_title(&match result {
+            title.clone_from(&match result {
                 InstallResult::Installed => format!("RAX - installed {}", done.name),
                 InstallResult::Failed(reason) => {
                     format!("RAX - could not install {}: {reason}", done.name)
@@ -500,8 +679,8 @@ mod tests {
     fn releasing_lifts_held_buttons_once() {
         let mut input = InputState::default();
         input.button(Button::Left, true);
-        assert_eq!(input.release(), Some(GuestInput::MouseButtons(0)));
-        assert_eq!(input.release(), None);
+        assert_eq!(input.release(), [GuestInput::MouseButtons(0)]);
+        assert_eq!(input.release(), []);
     }
 
     /// A press on a key bound at (0.5, 0.5), through the path the window uses.
@@ -584,6 +763,110 @@ mod tests {
         // Android connects wired networks by itself. The Android-x86 default
         // wraps the card as a Wi-Fi network that someone would have to join.
         assert!(ANDROID_CMDLINE.contains("VIRT_WIFI=0"));
+    }
+
+    const ALT: u8 = 0x38;
+
+    fn key_up(scancode: u8, extended: bool) -> GuestInput {
+        GuestInput::Key {
+            scancode,
+            extended,
+            down: false,
+        }
+    }
+
+    #[test]
+    fn alt_held_while_focus_is_lost_is_lifted() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        assert_eq!(input.release(), [key_up(ALT, false)]);
+        assert_eq!(input.release(), [], "lifted only once");
+    }
+
+    #[test]
+    fn a_key_already_released_is_not_lifted_again() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.key(ALT, false, false);
+        assert_eq!(input.release(), []);
+    }
+
+    #[test]
+    fn left_and_right_alt_are_different_keys() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.key(ALT, true, true);
+        input.key(ALT, false, false);
+        assert_eq!(input.release(), [key_up(ALT, true)]);
+    }
+
+    #[test]
+    fn auto_repeat_cannot_grow_the_held_list() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.key(ALT, false, true);
+        assert_eq!(input.release().len(), 1);
+    }
+
+    #[test]
+    fn keys_and_buttons_are_lifted_together() {
+        let mut input = InputState::default();
+        input.key(ALT, false, true);
+        input.button(Button::Left, true);
+        assert_eq!(
+            input.release(),
+            [key_up(ALT, false), GuestInput::MouseButtons(0)]
+        );
+    }
+
+    #[test]
+    fn f9_and_f10_become_home_and_back() {
+        assert_eq!(android_key(F9_SCANCODE, false), ANDROID_HOME);
+        assert_eq!(android_key(F10_SCANCODE, false), ANDROID_BACK);
+    }
+
+    #[test]
+    fn other_keys_pass_through() {
+        assert_eq!(android_key(0x1e, false), (0x1e, false));
+        assert_eq!(android_key(F9_SCANCODE, true), (F9_SCANCODE, true));
+    }
+
+    #[test]
+    fn only_the_gpu_needs_kernel_mode_setting() {
+        assert!(android_cmdline("vdb", false, true).contains("nomodeset HWACCEL=0"));
+        let gpu = android_cmdline("vdb", true, true);
+        assert!(!gpu.contains("nomodeset") && !gpu.contains("HWACCEL"));
+    }
+
+    #[test]
+    fn the_screen_mode_names_size_and_rate() {
+        assert_eq!(screen_mode(1280, 720), " video=Virtual-1:1280x720@240");
+    }
+
+    #[test]
+    fn memory_tuning_is_one_line_and_safe_to_repeat() {
+        let text = std::str::from_utf8(MEMORY_TUNING).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.ends_with('\n'));
+        assert!(text.starts_with("[ -e /dev/.rax ] ||"));
+    }
+
+    #[test]
+    fn the_command_line_and_the_machine_agree_on_cpus() {
+        assert!(APIC_INTERRUPTS.contains(&format!("nr_cpus={SESSION_CPUS}")));
+    }
+
+    #[test]
+    fn the_apic_path_must_not_be_disabled_on_the_command_line() {
+        // Regression test: `nosmp` silently turned the I/O APIC off.
+        let line = android_cmdline("vdb", true, true);
+        assert!(!line.contains("nosmp") && !line.contains("noapic") && !line.contains("nolapic"));
+        assert!(android_cmdline("vdb", false, false).contains(LEGACY_INTERRUPTS));
+    }
+
+    #[test]
+    fn a_folder_without_the_renderer_stays_on_software() {
+        assert_eq!(gpu_folder(Path::new("no-such-folder")), None);
     }
 
     #[test]

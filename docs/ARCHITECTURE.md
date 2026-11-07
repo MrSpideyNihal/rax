@@ -83,7 +83,7 @@ A single process with no installed service. The vCPU runs on the main thread, on
 
 ### Display
 
-The guest draws into a linear framebuffer described through `screen_info`, so the kernel's VESA driver needs no device behind it. Android renders in software. A native Win32 window shows it through GDI, copied while the vCPU is stopped, and `--screenshot` saves it as a BMP. This exists to boot and to see the guest. It is not the gaming graphics path, which remains unsolved.
+The guest draws into a linear framebuffer described through `screen_info`, so the kernel's VESA driver needs no device behind it. Android renders in software. A native Win32 window shows it through GDI, copied while the vCPU is stopped, and `--screenshot` saves it as a BMP. This exists to boot and to see the guest. It is not the gaming graphics path. `rax gpu probe` shows virglrenderer starting on the RTX 3050, and the `virtio-gpu` device that would connect it to Android is not built yet ([ADR-0008](ADR/0008-gpu-through-virglrenderer.md)).
 
 ### Mouse and keyboard
 

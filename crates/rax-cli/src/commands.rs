@@ -37,6 +37,11 @@ pub fn run(command: Command) -> Result<ExitCode, Box<dyn Error>> {
             Ok(ExitCode::SUCCESS)
         }
         Command::UiPreview { out } => ui_preview(&out),
+        Command::GpuProbe { folder } => {
+            let found = rax_host::virgl::probe(std::path::Path::new(&folder))?;
+            println!("{}", serde_json::to_string_pretty(&found)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Help | Command::Version => unreachable!("handled in main"),
     }
 }
@@ -261,6 +266,10 @@ fn vm_run(options: &VmRun) -> Result<ExitCode, Box<dyn Error>> {
         framebuffer: options
             .framebuffer
             .map(|(width, height)| Framebuffer { width, height }),
+        gpu: options.gpu.as_ref().map(PathBuf::from),
+        balloon: options.balloon,
+        apic: options.apic,
+        cpus: options.cpus,
         screenshot: options.screenshot.as_ref().map(PathBuf::from),
         network: options.network.then(rax_net::host::Network::start),
         touchscreen: options.touch_script.is_some(),

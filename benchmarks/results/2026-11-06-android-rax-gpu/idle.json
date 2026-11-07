@@ -1,0 +1,11 @@
+{
+    "schema_version":  1,
+    "benchmark":  "android-rax-idle",
+    "ram_mib":  2048,
+    "gpu":  true,
+    "settle_secs":  180,
+    "sample_secs":  60.02,
+    "percent_of_one_core":  2.29,
+    "working_set_mib":  2220.1,
+    "private_memory_mib":  2399.2
+}

@@ -30,6 +30,10 @@ Contributions that do any of this are rejected.
 
 A Play-enabled RAX ships only under a written licence from Google. Without one, RAX runs without Google apps.
 
+## Known violation
+
+On 2026-11-06, `pm list packages` showed that the Android-x86 9.0-r2 image contains `com.android.vending`, Google Play services and Chrome. It was assumed to be free of them. `scripts/fetch-android.ps1` downloads that image, which breaks the rule above, and `scripts/make-portable.ps1` copies it. The output of that script must not be published, and the image must be replaced with one that has no Google apps.
+
 ## Consequences
 
 - RAX cannot deliver a Play-purchased Minecraft to users unless Google agrees. This is the largest risk to the product.

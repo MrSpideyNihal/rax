@@ -4,12 +4,14 @@ use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::Thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rax_host::vm::{self, Kicker, Vm};
+use rax_host::virgl::Renderer;
+use rax_host::vm::{self, Interrupter, Kicker, RamReleaser, Vm};
 use rax_host::whp::{Api, ExitInfo, VmExit};
 use rax_input::Touch;
 use rax_net::host::Network;
@@ -20,15 +22,31 @@ use crate::boot::{self, BOOT_PARAMS_GPA, BzImage, CMDLINE_GPA, GDT_GPA};
 use crate::bus::{Bus, IoStats};
 use crate::cpio;
 use crate::framebuffer::{FRAMEBUFFER_GPA, Framebuffer};
+use crate::ioapic::Interrupt;
 use crate::mmio;
+use crate::mptable;
 use crate::ps2::GuestInput;
 use crate::serial::Sink;
+use crate::virtio_balloon::VirtioBalloon;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
-use crate::virtio_input::VirtioInput;
+use crate::virtio_gpu::{self, GpuStats, Scanout, VirtioGpu};
+use crate::virtio_input::{ISR_OFFSET, NOTIFY_OFFSET, VirtioInput};
 use crate::virtio_net::VirtioNet;
 
 /// Printed by the guest once user space is running.
 const READY_MARKER: &[u8] = b"RAX_GUEST_READY";
+/// Printed by Linux as it powers off. With the hypervisor's local APIC, its
+/// final `hlt` never reaches RAX, so this is how RAX learns the guest is done.
+const POWER_OFF_MARKER: &[u8] = b": Power down";
+/// The port Linux polls while timing its clock against the PIT.
+const SPEAKER_PORT: u16 = 0x61;
+/// Time between those polls. Linux rejects the whole measurement if it gets
+/// under 1000 reads in 10 ms, or if one read takes ten times the fastest. A VM
+/// exit can do that easily, and Android then ran with a clock that only moves
+/// every few milliseconds. Holding each read to this length passes both tests.
+const SPEAKER_POLL_NS: u64 = 8_000;
+/// Pacing only applies this long after boot, when Linux takes that measurement.
+const SPEAKER_PACING_ENDS_NS: u64 = 5_000_000_000;
 const INIT_PATH: &str = "rax-init";
 const BASE_CMDLINE: &str = "console=ttyS0 earlyprintk=serial,ttyS0,115200 nolapic noapic \
     acpi=off nosmp reboot=k panic=-1 i8042.noaux tsc=reliable rdinit=/rax-init";
@@ -40,6 +58,10 @@ const TIMER_IDLE: Duration = Duration::from_millis(1);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// How often a sleeping guest checks for a request to stop.
 const HALT_POLL: Duration = Duration::from_millis(50);
+/// The longest the guest waits for RAM to finish being released.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// How long the render thread stays awake after finishing work.
+const RENDER_SPIN: Duration = Duration::from_micros(200);
 /// Console text kept for a running app, in bytes.
 const CONSOLE_KEEP: usize = 16 * 1024;
 
@@ -88,12 +110,22 @@ pub struct Config {
     pub own_init_cmdline: Option<String>,
     /// Gives the guest a screen of this size.
     pub framebuffer: Option<Framebuffer>,
+    /// Folder holding virglrenderer. The screen then comes from a virtio GPU
+    /// drawing on the host's graphics card.
+    pub gpu: Option<PathBuf>,
     /// Saves the screen to this BMP file when the guest stops.
     pub screenshot: Option<PathBuf>,
     /// Gives the guest a network card, with internet through this network.
     pub network: Option<Network>,
     /// Gives the guest a multi-touch screen.
     pub touchscreen: bool,
+    /// Lets the guest give unused RAM back to the host.
+    pub balloon: bool,
+    /// Uses the hypervisor's local APIC and an I/O APIC, for guests that
+    /// boot without `nolapic noapic`.
+    pub apic: bool,
+    /// Virtual CPUs. More than one needs `apic`.
+    pub cpus: u8,
     /// Connects a live window. `None` runs headless.
     pub display: Option<Display>,
     /// Timed input, for repeatable tests with no person at the keyboard.
@@ -117,6 +149,8 @@ pub struct Display {
     pub console_input: Arc<Mutex<Vec<u8>>>,
     /// What the console has printed, newest last.
     pub console_output: Arc<Mutex<String>>,
+    /// Frames the guest has presented so far.
+    pub frames: Arc<AtomicU64>,
 }
 
 impl Display {
@@ -130,6 +164,7 @@ impl Display {
             touches: Arc::new(Mutex::new(Vec::new())),
             console_input: Arc::new(Mutex::new(Vec::new())),
             console_output: Arc::new(Mutex::new(String::new())),
+            frames: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -171,14 +206,17 @@ pub struct Report {
     pub io: IoStats,
     /// Busiest ports with no device, as `(port, accesses)`.
     pub unclaimed_ports: Vec<(u16, u64)>,
+    /// GPU activity, if there is a GPU.
+    pub gpu: Option<GpuStats>,
 }
 
-struct Finished {
-    outcome: Outcome,
-    exits: u64,
-    interrupts: u64,
-    floating_pages: u64,
-    window_exits: u64,
+/// Totals across all vCPUs.
+#[derive(Default)]
+struct Counters {
+    exits: AtomicU64,
+    interrupts: AtomicU64,
+    floating_pages: AtomicU64,
+    window_exits: AtomicU64,
 }
 
 /// Writes the console to stdout and notes when the marker appears.
@@ -187,6 +225,8 @@ struct Console {
     /// Shell prompts end without a newline, so they must not wait for one.
     flush_every_byte: bool,
     matched: usize,
+    matched_power_off: usize,
+    powered_off: Arc<AtomicBool>,
     ready: Arc<Mutex<Option<Instant>>>,
     /// Also keeps recent output here, for a running app to read.
     capture: Option<Arc<Mutex<String>>>,
@@ -208,7 +248,12 @@ impl Sink for Console {
         if self.flush_every_byte || byte == b'\n' {
             let _ = self.out.flush();
         }
-        self.matched = next_match(self.matched, byte);
+        self.matched_power_off = next_match(POWER_OFF_MARKER, self.matched_power_off, byte);
+        if self.matched_power_off == POWER_OFF_MARKER.len() {
+            self.matched_power_off = 0;
+            self.powered_off.store(true, Ordering::Relaxed);
+        }
+        self.matched = next_match(READY_MARKER, self.matched, byte);
         if self.matched == READY_MARKER.len() {
             self.matched = 0;
             if let Ok(mut ready) = self.ready.lock() {
@@ -218,13 +263,13 @@ impl Sink for Console {
     }
 }
 
-/// Advances a search for [`READY_MARKER`]. Its first byte does not repeat, so
-/// a mismatch only ever needs to restart.
-fn next_match(matched: usize, byte: u8) -> usize {
-    if READY_MARKER[matched] == byte {
+/// Advances a search for `marker`. A marker's first byte must not repeat in
+/// it, so a mismatch only ever needs to restart.
+fn next_match(marker: &[u8], matched: usize, byte: u8) -> usize {
+    if marker[matched] == byte {
         matched + 1
     } else {
-        usize::from(READY_MARKER[0] == byte)
+        usize::from(marker[0] == byte)
     }
 }
 
@@ -240,12 +285,50 @@ struct Shared {
     stop: AtomicBool,
     started: Instant,
     display: Option<Display>,
+    /// Rows in the display's frame.
+    screen_height: usize,
     input_script: Vec<(Duration, GuestInput)>,
     touch_script: Vec<(Duration, Touch)>,
     /// Set when touches are waiting to reach guest memory.
     touch_ready: AtomicBool,
     /// Set when the network has frames waiting for the guest.
     network_ready: Option<Arc<AtomicBool>>,
+    /// Hands guest RAM to the thread that gives it back to Windows.
+    releases: Sender<Release>,
+    /// Set when the guest's console says it has powered off.
+    powered_off: Arc<AtomicBool>,
+    /// When the configured run time ends.
+    deadline: Instant,
+    /// The GPU, if there is one.
+    gpu: Option<GpuLink>,
+    counters: Counters,
+}
+
+/// Work for the thread that gives RAM back. Windows takes up to milliseconds
+/// per call, so doing this on the vCPU thread starved the guest: measured,
+/// 11 seconds of guest time passed in 4 minutes.
+enum Release {
+    Discard {
+        gpa: u64,
+        length: u64,
+    },
+    /// Answered once everything sent earlier is done.
+    Finish(Sender<()>),
+}
+
+fn release_loop(shared: &Shared, releaser: &RamReleaser<'_>, work: &Receiver<Release>) {
+    while !shared.stop.load(Ordering::Relaxed) {
+        match work.recv_timeout(HALT_POLL) {
+            Ok(Release::Discard { gpa, length }) => {
+                // A failure only means this memory stays with the guest.
+                let _ = releaser.discard(gpa, length as usize);
+            }
+            Ok(Release::Finish(done)) => {
+                let _ = done.send(());
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 impl Shared {
@@ -264,9 +347,30 @@ impl Shared {
     }
 }
 
-fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<u8>>>) {
+fn send_interrupts(interrupter: &Interrupter<'_>, interrupts: Vec<Interrupt>) {
+    for interrupt in interrupts {
+        // A failure here is not recoverable and would show as a stalled
+        // guest, so it is printed rather than dropped.
+        if let Err(error) = interrupter.send(
+            interrupt.vector,
+            interrupt.destination,
+            interrupt.logical,
+            interrupt.lowest_priority,
+        ) {
+            eprintln!("could not deliver interrupt {interrupt:?}: {error}");
+        }
+    }
+}
+
+fn timer_loop(
+    shared: &Shared,
+    kicker: &Kicker<'_>,
+    interrupter: &Interrupter<'_>,
+    input: Option<&Receiver<Vec<u8>>>,
+) {
     let mut script_position = 0;
     let mut touch_position = 0;
+    let mut last_screen_kick = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
         let now = shared.now_ns();
         let window_input: Vec<GuestInput> = shared
@@ -319,7 +423,29 @@ fn timer_loop(shared: &Shared, kicker: &Kicker<'_>, input: Option<&Receiver<Vec<
         }
         let pending = bus.tick(now);
         let next = bus.next_timer_ns();
+        let interrupts = bus.take_interrupts();
         drop(bus);
+        send_interrupts(interrupter, interrupts);
+        // A sleeping guest no longer exits to RAX by itself, so this thread
+        // has to wake the vCPU for anything that should stop it.
+        let stopping = shared.powered_off.load(Ordering::Relaxed)
+            || Instant::now() >= shared.deadline
+            || shared
+                .display
+                .as_ref()
+                .is_some_and(|display| display.stop.load(Ordering::Relaxed));
+        if stopping {
+            kicker.kick_all();
+        }
+        // The vCPU also copies a software screen, and a sleeping guest no
+        // longer exits by itself.
+        if shared.gpu.is_none()
+            && shared.display.is_some()
+            && last_screen_kick.elapsed() >= FRAME_INTERVAL
+        {
+            last_screen_kick = Instant::now();
+            kicker.kick();
+        }
         if pending || shared.network_pending() {
             shared.wake.notify_all();
             kicker.kick();
@@ -377,7 +503,7 @@ fn wait_while_halted(shared: &Shared, deadline: Instant) -> Result<(), &'static 
 }
 
 /// Guest RAM for devices. Only used while the vCPU is stopped at an exit.
-struct RamView<'a, 'b>(&'a Vm<'b>);
+struct RamView<'a, 'b>(&'a Vm<'b>, &'a Shared);
 
 impl GuestMemory for RamView<'_, '_> {
     fn read(&self, gpa: u64, buffer: &mut [u8]) -> Result<(), OutOfRange> {
@@ -386,6 +512,174 @@ impl GuestMemory for RamView<'_, '_> {
 
     fn write(&self, gpa: u64, bytes: &[u8]) -> Result<(), OutOfRange> {
         self.0.write_ram(gpa, bytes).map_err(|_| OutOfRange)
+    }
+
+    fn discard(&self, gpa: u64, length: u64) {
+        let _ = self.1.releases.send(Release::Discard { gpa, length });
+    }
+
+    fn finish_discards(&self) {
+        let (done, finished) = mpsc::channel();
+        if self.1.releases.send(Release::Finish(done)).is_ok() {
+            // No answer only means RAX is shutting down.
+            let _ = finished.recv_timeout(RELEASE_WAIT);
+        }
+    }
+}
+
+/// What the vCPUs share with the render thread.
+struct GpuLink {
+    device: Mutex<VirtioGpu>,
+    /// The interrupt status, readable without the device lock.
+    isr: Arc<AtomicU8>,
+    /// Set when the guest has queued work.
+    notified: AtomicBool,
+    /// The render thread, once it is running.
+    render_thread: OnceLock<Thread>,
+    /// The last frame, for a screenshot once the guest has stopped.
+    last_frame: Mutex<Option<(Scanout, Vec<u8>)>>,
+}
+
+impl GpuLink {
+    fn new(device: VirtioGpu) -> Self {
+        Self {
+            isr: device.isr(),
+            device: Mutex::new(device),
+            notified: AtomicBool::new(false),
+            render_thread: OnceLock::new(),
+            last_frame: Mutex::new(None),
+        }
+    }
+
+    fn notify(&self) {
+        self.notified.store(true, Ordering::Release);
+        if let Some(thread) = self.render_thread.get() {
+            thread.unpark();
+        }
+    }
+}
+
+/// Reads what is on screen, as BGRX.
+fn read_screen(
+    link: &GpuLink,
+    renderer: &mut Renderer<'_>,
+    pixels: &mut Vec<u8>,
+) -> Option<Scanout> {
+    let started = Instant::now();
+    let screen = link.device.lock().ok()?.scanout()?;
+    let bytes = screen.width as usize * screen.height as usize * 4;
+    pixels.resize(bytes, 0);
+    renderer.prepare();
+    let code = renderer.read_pixels(screen.resource, screen.width, screen.height, pixels);
+    if code != 0 {
+        return None;
+    }
+    if screen.swap_red_blue {
+        virtio_gpu::swap_red_blue(pixels);
+    }
+    if let Ok(mut device) = link.device.lock() {
+        device.record_present(started.elapsed());
+    }
+    Some(screen)
+}
+
+/// Runs the queues once, and tells the guest if anything finished.
+fn render_once(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    link: &GpuLink,
+    renderer: &mut Renderer<'_>,
+    kicker: &Kicker<'_>,
+    interrupter: &Interrupter<'_>,
+) -> Result<(), &'static str> {
+    let mut device = link.device.lock().map_err(|_| "GPU lock poisoned")?;
+    device.service(&RamView(vm, shared), renderer);
+    let finished = device.take_irq();
+    let frames = device.stats().flushes;
+    drop(device);
+    if let Some(display) = &shared.display {
+        display.frames.store(frames, Ordering::Relaxed);
+    }
+    if finished {
+        let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+        bus.raise_gpu();
+        let pending = bus.pending_vector().is_some();
+        let interrupts = bus.take_interrupts();
+        drop(bus);
+        send_interrupts(interrupter, interrupts);
+        // Without an I/O APIC, the vCPU has to wake up to inject it.
+        if pending {
+            shared.wake.notify_all();
+            kicker.kick();
+        }
+    }
+    Ok(())
+}
+
+/// Owns the renderer, because an OpenGL context cannot change threads. The
+/// guest keeps running while this works, so a long draw no longer stops it.
+fn render_loop(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    link: &GpuLink,
+    mut renderer: Renderer<'_>,
+    kicker: &Kicker<'_>,
+    interrupter: &Interrupter<'_>,
+) {
+    let mut pixels = Vec::new();
+    let mut last_frame = Instant::now();
+    let mut last_work = Instant::now();
+    while !shared.stop.load(Ordering::Relaxed) {
+        if link.notified.swap(false, Ordering::Acquire) {
+            if render_once(vm, shared, link, &mut renderer, kicker, interrupter).is_err() {
+                return;
+            }
+            last_work = Instant::now();
+            continue;
+        }
+        if last_frame.elapsed() >= FRAME_INTERVAL {
+            last_frame = Instant::now();
+            renderer.poll();
+            let waiting = link
+                .device
+                .lock()
+                .is_ok_and(|mut device| device.take_frame_waiting());
+            if waiting
+                && let Some(display) = &shared.display
+                && let Some(screen) = read_screen(link, &mut renderer, &mut pixels)
+                && let Ok(mut frame) = display.frame.lock()
+            {
+                let rows = shared.screen_height.max(1);
+                let columns = frame.len() / 4 / rows;
+                virtio_gpu::copy_scaled(
+                    &pixels,
+                    (screen.width, screen.height),
+                    &mut frame,
+                    (columns as u32, rows as u32),
+                );
+            }
+        }
+        // Stay awake briefly: the guest's next request usually follows at
+        // once, and it waits for this thread to wake.
+        if last_work.elapsed() < RENDER_SPIN {
+            std::hint::spin_loop();
+        } else {
+            std::thread::park_timeout(FRAME_INTERVAL);
+        }
+    }
+    if let Some(screen) = read_screen(link, &mut renderer, &mut pixels)
+        && let Ok(mut last) = link.last_frame.lock()
+    {
+        *last = Some((screen, pixels));
+    }
+}
+
+/// The part of a register a store of `size` bytes writes.
+fn stored_register(register: u64, size: u8) -> u32 {
+    match size {
+        1 => register as u32 & 0xff,
+        2 => register as u32 & 0xffff,
+        _ => register as u32,
     }
 }
 
@@ -400,20 +694,52 @@ fn device_memory(
     let access = mmio::decode(bytes)
         .ok_or_else(|| format!("cannot decode device access {bytes:02x?} at {gpa:#x}"))?;
     let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+    if let (Some(offset), Some(link)) = (bus.gpu_offset(gpa), shared.gpu.as_ref()) {
+        drop(bus);
+        if access.write {
+            let value = match access.immediate {
+                Some(value) => value,
+                None => {
+                    stored_register(vm.general_register(info.vp, access.register)?, access.size)
+                }
+            };
+            // A notification must not wait for the draw in progress.
+            if offset == NOTIFY_OFFSET {
+                link.notify();
+            } else {
+                link.device
+                    .lock()
+                    .map_err(|_| "GPU lock poisoned")?
+                    .write(offset, value);
+            }
+            vm.advance(info, access.length)?;
+        } else {
+            let value = if offset == ISR_OFFSET {
+                u32::from(link.isr.swap(0, Ordering::Relaxed))
+            } else {
+                link.device
+                    .lock()
+                    .map_err(|_| "GPU lock poisoned")?
+                    .read(offset, access.size)
+            };
+            vm.finish_load(
+                info,
+                access.register,
+                access.size,
+                value,
+                access.zero_extend,
+                access.length,
+            )?;
+        }
+        return Ok(());
+    }
     if access.write {
         let value = match access.immediate {
             Some(value) => value,
-            None => {
-                let register = vm.general_register(access.register)? as u32;
-                match access.size {
-                    1 => register & 0xff,
-                    2 => register & 0xffff,
-                    _ => register,
-                }
-            }
+            None => stored_register(vm.general_register(info.vp, access.register)?, access.size),
         };
         bus.memory_write(gpa, value);
-        bus.service_devices(&RamView(vm));
+        bus.service_devices(&RamView(vm, shared));
         vm.advance(info, access.length)?;
     } else {
         let value = bus.memory_read(gpa, access.size);
@@ -427,6 +753,19 @@ fn device_memory(
         )?;
     }
     Ok(())
+}
+
+/// Picks what to report from all the CPUs: any failure, then the first real
+/// reason to stop. The rest only stopped because one CPU did.
+fn choose_outcome(results: Vec<Result<Outcome, String>>) -> Result<Outcome, Box<dyn Error>> {
+    let mut outcome = Outcome::Stopped;
+    for result in results {
+        let this = result?;
+        if outcome == Outcome::Stopped {
+            outcome = this;
+        }
+    }
+    Ok(outcome)
 }
 
 /// What to do about interrupts before the vCPU next runs.
@@ -451,75 +790,84 @@ fn delivery(pending: Option<u8>, interruptible: bool) -> Delivery {
     }
 }
 
-fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished, Box<dyn Error>> {
-    let mut exits = 0_u64;
-    let mut interrupts = 0_u64;
-    let mut floating_pages = 0_u64;
-    let mut window_exits = 0_u64;
+fn vcpu_loop(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    vp: u32,
+    interrupter: &Interrupter<'_>,
+    deadline: Instant,
+) -> Result<Outcome, Box<dyn Error>> {
+    let counters = &shared.counters;
     let mut last_frame = Instant::now();
     let mut interruptible = false;
+    let mut last_speaker_poll = 0;
     loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            return Ok(Outcome::Stopped);
+        }
+        let frame_due = vp == 0 && last_frame.elapsed() >= FRAME_INTERVAL;
+        if frame_due {
+            last_frame = Instant::now();
+        }
         if let Some(display) = &shared.display {
             if display.stop.load(Ordering::Relaxed) {
-                return Ok(Finished {
-                    outcome: Outcome::Stopped,
-                    exits,
-                    interrupts,
-                    floating_pages,
-                    window_exits,
-                });
+                return Ok(Outcome::Stopped);
             }
-            if last_frame.elapsed() >= FRAME_INTERVAL {
-                last_frame = Instant::now();
-                if let Ok(mut frame) = display.frame.try_lock() {
-                    vm.read_framebuffer(&mut frame)?;
-                }
+            if frame_due
+                && shared.gpu.is_none()
+                && let Ok(mut frame) = display.frame.try_lock()
+            {
+                vm.read_framebuffer(&mut frame)?;
             }
         }
+        if shared.powered_off.load(Ordering::Relaxed) {
+            return Ok(Outcome::PoweredOff);
+        }
         if Instant::now() >= deadline {
-            return Ok(Finished {
-                outcome: Outcome::TimedOut,
-                exits,
-                interrupts,
-                floating_pages,
-                window_exits,
-            });
+            return Ok(Outcome::TimedOut);
         }
         {
             let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+            if frame_due {
+                bus.poll_balloon(shared.now_ns(), &RamView(vm, shared));
+            }
             let touched = shared.touch_ready.swap(false, Ordering::Relaxed);
             let frames = shared
                 .network_ready
                 .as_ref()
                 .is_some_and(|ready| ready.swap(false, Ordering::Relaxed));
             if touched || frames {
-                bus.service_devices(&RamView(vm));
+                bus.service_devices(&RamView(vm, shared));
             }
             if bus.reset_requested() {
-                return Ok(Finished {
-                    outcome: Outcome::Reset,
-                    exits,
-                    interrupts,
-                    floating_pages,
-                    window_exits,
-                });
+                return Ok(Outcome::Reset);
             }
-            match delivery(bus.pending_vector(), interruptible) {
-                Delivery::Inject(vector) => {
-                    vm.inject_interrupt(vector)?;
-                    bus.acknowledge_interrupt();
-                    interrupts += 1;
+            send_interrupts(interrupter, bus.take_interrupts());
+            // The 8259 is wired to the first CPU only.
+            if vp == 0 {
+                match delivery(bus.pending_vector(), interruptible) {
+                    Delivery::Inject(vector) => {
+                        vm.inject_interrupt(vector)?;
+                        bus.acknowledge_interrupt();
+                        counters.interrupts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Delivery::AskForWindow => vm.request_interrupt_window()?,
+                    Delivery::Nothing => {}
                 }
-                Delivery::AskForWindow => vm.request_interrupt_window()?,
-                Delivery::Nothing => {}
             }
         }
 
-        let info = vm.run()?;
-        exits += 1;
+        let info = vm.run(vp)?;
+        counters.exits.fetch_add(1, Ordering::Relaxed);
         interruptible = info.interruptible;
         match info.exit {
             VmExit::PortRead { port, size } => {
+                if port == SPEAKER_PORT && shared.now_ns() < SPEAKER_PACING_ENDS_NS {
+                    while shared.now_ns() < last_speaker_poll + SPEAKER_POLL_NS {
+                        std::hint::spin_loop();
+                    }
+                    last_speaker_poll = shared.now_ns();
+                }
                 let now = shared.now_ns();
                 let value = shared
                     .bus
@@ -532,23 +880,22 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                 let now = shared.now_ns();
                 let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
                 bus.write(port, size, value, now);
-                bus.service_devices(&RamView(vm));
+                bus.service_devices(&RamView(vm, shared));
                 drop(bus);
                 vm.skip_instruction(&info)?;
             }
             VmExit::Halted => {
+                if vp != 0 {
+                    continue;
+                }
                 if !info.interruptible {
-                    return Ok(Finished {
-                        outcome: Outcome::PoweredOff,
-                        exits,
-                        interrupts,
-                        floating_pages,
-                        window_exits,
-                    });
+                    return Ok(Outcome::PoweredOff);
                 }
                 wait_while_halted(shared, deadline)?;
             }
-            VmExit::InterruptWindow => window_exits += 1,
+            VmExit::InterruptWindow => {
+                counters.window_exits.fetch_add(1, Ordering::Relaxed);
+            }
             VmExit::Canceled => {}
             VmExit::Mmio {
                 gpa,
@@ -570,7 +917,7 @@ fn vcpu_loop(vm: &Vm<'_>, shared: &Shared, deadline: Instant) -> Result<Finished
                 // Linux probes for chipset registers that this machine does
                 // not have, and expects all ones when nothing answers.
                 vm.map_floating_page(gpa)?;
-                floating_pages += 1;
+                counters.floating_pages.fetch_add(1, Ordering::Relaxed);
             }
             VmExit::Mmio { gpa, write, .. } => {
                 return Err(format!(
@@ -646,18 +993,27 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         None => command_line(&api, !disks.is_empty() || config.network.is_some()),
     };
 
-    let mut vm = Vm::new(&api, config.ram_mib * 1024 * 1024)?;
-    if let Some(screen) = config.framebuffer {
+    if config.cpus > 1 && !config.apic {
+        return Err("more than one CPU needs the APIC".into());
+    }
+    let mut vm = Vm::with_local_apic(
+        &api,
+        config.ram_mib * 1024 * 1024,
+        u32::from(config.cpus.max(1)),
+        config.apic,
+    )?;
+    if config.apic {
+        vm.write_ram(mptable::MP_GPA, &mptable::build(config.cpus.max(1)))?;
+    }
+    // With a GPU, the guest finds its screen there and not in the boot data.
+    let vesa_screen = config.framebuffer.filter(|_| config.gpu.is_none());
+    if let Some(screen) = vesa_screen {
         vm.add_framebuffer(u64::from(FRAMEBUFFER_GPA), screen.size_bytes())?;
     }
     vm.write_ram(kernel.load_address(), kernel.payload())?;
     vm.write_ram(initrd_gpa, &initrd)?;
     vm.write_ram(CMDLINE_GPA, &boot::cmdline_bytes(&cmdline)?)?;
-    let params = kernel.boot_params(
-        ram_bytes,
-        Some((initrd_gpa, initrd.len())),
-        config.framebuffer,
-    )?;
+    let params = kernel.boot_params(ram_bytes, Some((initrd_gpa, initrd.len())), vesa_screen)?;
     vm.write_ram(BOOT_PARAMS_GPA, &params)?;
     let gdt = boot::gdt_bytes();
     vm.write_ram(GDT_GPA, &gdt)?;
@@ -669,10 +1025,13 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     )?;
 
     let ready = Arc::new(Mutex::new(None));
+    let powered_off = Arc::new(AtomicBool::new(false));
     let console = Console {
         out: std::io::stdout(),
         flush_every_byte: config.shell,
         matched: 0,
+        matched_power_off: 0,
+        powered_off: Arc::clone(&powered_off),
         ready: Arc::clone(&ready),
         capture: config
             .display
@@ -693,6 +1052,7 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     });
     let started = Instant::now();
     let deadline = started + config.timeout;
+    let (releases, release_work) = mpsc::channel();
     let shared = Shared {
         bus: Mutex::new(Bus::new(
             Box::new(console),
@@ -700,25 +1060,107 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
             disks,
             card,
             config.touchscreen.then(VirtioInput::default),
+            config.gpu.is_some(),
+            config.balloon.then(VirtioBalloon::default),
         )),
         wake: Condvar::new(),
         stop: AtomicBool::new(false),
         started,
         display: config.display.clone(),
+        screen_height: config
+            .framebuffer
+            .map_or(0, |screen| usize::from(screen.height)),
         input_script: config.input_script.clone(),
         touch_script: config.touch_script.clone(),
         touch_ready: AtomicBool::new(false),
         network_ready,
+        releases,
+        powered_off,
+        deadline,
+        counters: Counters::default(),
+        gpu: config.gpu.as_ref().and(config.framebuffer).map(|screen| {
+            GpuLink::new(VirtioGpu::new(
+                u32::from(screen.width),
+                u32::from(screen.height),
+            ))
+        }),
     };
+    if config.gpu.is_some() && shared.gpu.is_none() {
+        return Err("a GPU needs a screen size".into());
+    }
+    if config.apic {
+        shared
+            .bus
+            .lock()
+            .map_err(|_| "device lock poisoned")?
+            .add_ioapic(config.cpus.max(1));
+    }
     let kicker = vm.kicker();
+    let interrupter = vm.interrupter();
+    let releaser = vm.ram_releaser();
     let input = config.shell.then(spawn_stdin_reader);
 
     let finished = std::thread::scope(|scope| {
-        let (timer_shared, timer_kicker) = (&shared, &kicker);
-        scope.spawn(move || timer_loop(timer_shared, timer_kicker, input.as_ref()));
-        let result = vcpu_loop(&vm, &shared, deadline);
-        shared.stop.store(true, Ordering::Relaxed);
-        result
+        let (timer_shared, timer_kicker, timer_interrupter) = (&shared, &kicker, &interrupter);
+        scope.spawn(move || {
+            timer_loop(
+                timer_shared,
+                timer_kicker,
+                timer_interrupter,
+                input.as_ref(),
+            );
+        });
+        let (release_shared, release_handle) = (&shared, &releaser);
+        scope.spawn(move || release_loop(release_shared, release_handle, &release_work));
+        if let (Some(link), Some(folder)) = (&shared.gpu, &config.gpu) {
+            let (vm, shared, kicker, interrupter) = (&vm, &shared, &kicker, &interrupter);
+            let (started, outcome) = mpsc::channel();
+            let thread = scope.spawn(move || match vm.start_renderer(folder) {
+                Ok(renderer) => {
+                    let _ = started.send(Ok(()));
+                    render_loop(vm, shared, link, renderer, kicker, interrupter);
+                }
+                Err(error) => {
+                    let _ = started.send(Err(error.to_string()));
+                }
+            });
+            let _ = link.render_thread.set(thread.thread().clone());
+            let start = outcome
+                .recv()
+                .map_err(|_| String::from("the render thread stopped"))
+                .and_then(|result| result);
+            if let Err(error) = start {
+                shared.stop.store(true, Ordering::Relaxed);
+                return Err(error.into());
+            }
+        }
+        let run_cpu = |vp: u32| {
+            let result = vcpu_loop(&vm, &shared, vp, &interrupter, deadline)
+                .map_err(|error| error.to_string());
+            // One CPU stopping means the whole guest has stopped.
+            shared.stop.store(true, Ordering::Relaxed);
+            kicker.kick_all();
+            result
+        };
+        let others: Vec<_> = (1..u32::from(config.cpus))
+            .map(|vp| scope.spawn(move || run_cpu(vp)))
+            .collect();
+        let first = run_cpu(0);
+        // A CPU can be between its stop check and running the guest, where a
+        // single kick would be lost.
+        while !others
+            .iter()
+            .all(std::thread::ScopedJoinHandle::is_finished)
+        {
+            kicker.kick_all();
+            std::thread::sleep(TIMER_IDLE);
+        }
+        let mut results = vec![first];
+        results.extend(others.into_iter().map(|cpu| {
+            cpu.join()
+                .unwrap_or_else(|_| Err(String::from("a vCPU thread panicked")))
+        }));
+        choose_outcome(results)
     })
     .inspect(|_| {
         let _ = std::io::stdout().flush();
@@ -727,9 +1169,26 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let total_ms = started.elapsed().as_secs_f64() * 1e3;
     if let (Some(screen), Some(path)) = (config.framebuffer, &config.screenshot) {
         let mut pixels = vec![0_u8; screen.size_bytes()];
-        vm.read_framebuffer(&mut pixels)?;
+        match &shared.gpu {
+            Some(link) => {
+                let last = link.last_frame.lock().map_err(|_| "GPU lock poisoned")?;
+                if let Some((shown, source)) = last.as_ref() {
+                    virtio_gpu::copy_scaled(
+                        source,
+                        (shown.width, shown.height),
+                        &mut pixels,
+                        (u32::from(screen.width), u32::from(screen.height)),
+                    );
+                }
+            }
+            None => vm.read_framebuffer(&mut pixels)?,
+        }
         std::fs::write(path, screen.to_bmp(&pixels))?;
     }
+    let gpu_stats = match &shared.gpu {
+        Some(link) => Some(link.device.lock().map_err(|_| "GPU lock poisoned")?.stats()),
+        None => None,
+    };
     let boot_to_user_space_ms = ready
         .lock()
         .map_err(|_| "ready lock poisoned")?
@@ -738,16 +1197,17 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let (io, unclaimed_ports) = (bus.stats(), bus.busiest_unclaimed_ports(5));
     drop(bus);
     Ok(Report {
-        outcome: finished.outcome,
+        outcome: finished,
         ram_mib: config.ram_mib,
         boot_to_user_space_ms,
         total_ms,
-        vcpu_exits: finished.exits,
-        interrupts: finished.interrupts,
-        floating_pages: finished.floating_pages,
-        interrupt_window_exits: finished.window_exits,
+        vcpu_exits: shared.counters.exits.load(Ordering::Relaxed),
+        interrupts: shared.counters.interrupts.load(Ordering::Relaxed),
+        floating_pages: shared.counters.floating_pages.load(Ordering::Relaxed),
+        interrupt_window_exits: shared.counters.window_exits.load(Ordering::Relaxed),
         io,
         unclaimed_ports,
+        gpu: gpu_stats,
     })
 }
 
@@ -756,11 +1216,15 @@ mod tests {
     use super::*;
 
     fn scan(text: &[u8]) -> usize {
+        scan_for(READY_MARKER, text)
+    }
+
+    fn scan_for(marker: &[u8], text: &[u8]) -> usize {
         let mut matched = 0;
         let mut found = 0;
         for &byte in text {
-            matched = next_match(matched, byte);
-            if matched == READY_MARKER.len() {
+            matched = next_match(marker, matched, byte);
+            if matched == marker.len() {
                 matched = 0;
                 found += 1;
             }
@@ -781,6 +1245,53 @@ mod tests {
     #[test]
     fn ignores_text_without_the_marker() {
         assert_eq!(scan(b"RAX_GUEST_NOT_READY"), 0);
+    }
+
+    #[test]
+    fn power_off_is_found_in_the_console() {
+        assert_eq!(
+            scan_for(POWER_OFF_MARKER, b"[ 9.1] reboot: Power down\n"),
+            1
+        );
+        assert_eq!(
+            scan_for(POWER_OFF_MARKER, b"reboot: Restarting system\n"),
+            0
+        );
+    }
+
+    #[test]
+    fn the_power_off_marker_can_restart_on_a_mismatch() {
+        assert!(!POWER_OFF_MARKER[1..].contains(&POWER_OFF_MARKER[0]));
+    }
+
+    #[test]
+    fn speaker_pacing_passes_the_kernels_two_tests() {
+        // At least 1000 reads in 10 ms, and a 50 us host hiccup stays under
+        // ten times the fastest read.
+        const { assert!(10_000_000 / SPEAKER_POLL_NS >= 1000) };
+        const { assert!(50_000 < 10 * SPEAKER_POLL_NS) };
+    }
+
+    #[test]
+    fn a_real_outcome_beats_cpus_that_merely_stopped() {
+        let results = vec![
+            Ok(Outcome::Stopped),
+            Ok(Outcome::Reset),
+            Ok(Outcome::Stopped),
+        ];
+        assert_eq!(choose_outcome(results).unwrap(), Outcome::Reset);
+    }
+
+    #[test]
+    fn the_first_cpu_to_stop_for_a_reason_wins() {
+        let results = vec![Ok(Outcome::TimedOut), Ok(Outcome::PoweredOff)];
+        assert_eq!(choose_outcome(results).unwrap(), Outcome::TimedOut);
+    }
+
+    #[test]
+    fn a_failure_on_any_cpu_is_reported() {
+        let results = vec![Ok(Outcome::Stopped), Err(String::from("bad"))];
+        assert!(choose_outcome(results).is_err());
     }
 
     #[test]

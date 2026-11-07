@@ -1,6 +1,6 @@
 # ADR-0003: gfxstream on host Vulkan, with no passthrough claims
 
-Status: Proposed. Phase 2 decides.
+Status: Replaced by [ADR-0008](0008-gpu-through-virglrenderer.md), 2026-11-06. Its rule against claiming passthrough still stands.
 
 ## Problem
 
