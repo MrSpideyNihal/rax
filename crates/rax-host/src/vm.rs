@@ -271,6 +271,15 @@ impl Kicker<'_> {
     }
 }
 
+// SAFETY: every WHP call here is made for use from device and vCPU threads.
+// Guest RAM is plain bytes reached only through raw copies, and the guest can
+// change it at any moment anyway, so concurrent access cannot break a Rust
+// reference. Device rings order their own accesses, as they do on real
+// hardware.
+unsafe impl Sync for Vm<'_> {}
+// SAFETY: as above. Nothing in `Vm` is tied to the thread that created it.
+unsafe impl Send for Vm<'_> {}
+
 /// Reads the processor clock in hertz, when the hypervisor reports one.
 pub fn tsc_hz(api: &Api) -> Option<u64> {
     api.processor_clock_hz().ok().filter(|&hz| hz != 0)

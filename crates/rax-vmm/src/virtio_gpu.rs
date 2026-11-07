@@ -10,6 +10,8 @@
 //! already runs after the one it guards, on the same OpenGL stream.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use rax_host::virgl::{Renderer, ResourceArgs, Transfer, TransferBox};
@@ -60,6 +62,7 @@ const TARGET_TEXTURE_2D: u32 = 2;
 const BIND_RENDER_TARGET: u32 = 1 << 1;
 const FLAG_Y_0_TOP: u32 = 1;
 
+const ISR_QUEUE: u8 = 1;
 const FORMAT_R8G8B8A8: u32 = 67;
 const FORMAT_R8G8B8X8: u32 = 134;
 
@@ -252,6 +255,9 @@ pub struct VirtioGpu {
     scanout: u32,
     frame_waiting: bool,
     irq_requested: bool,
+    /// Interrupt status. Kept apart from the lock around this device, so a
+    /// vCPU taking an interrupt never waits for a long draw to finish.
+    isr: Arc<AtomicU8>,
     stats: GpuStats,
     timing: Timing,
 }
@@ -279,9 +285,16 @@ impl VirtioGpu {
             scanout: 0,
             frame_waiting: false,
             irq_requested: false,
+            isr: Arc::new(AtomicU8::new(0)),
             stats: GpuStats::default(),
             timing: Timing::default(),
         }
+    }
+
+    /// A handle to the interrupt status register.
+    #[must_use]
+    pub fn isr(&self) -> Arc<AtomicU8> {
+        Arc::clone(&self.isr)
     }
 
     /// Returns true once for each interrupt since the last call.
@@ -323,7 +336,7 @@ impl VirtioGpu {
     /// Handles a read of the device's memory.
     pub fn read(&mut self, offset: u64, size: u8) -> u32 {
         match offset {
-            ISR_OFFSET => u32::from(self.common.take_isr()),
+            ISR_OFFSET => u32::from(self.isr.swap(0, Ordering::Relaxed)),
             NOTIFY_OFFSET..ISR_OFFSET => 0,
             DEVICE_OFFSET.. => match offset - DEVICE_OFFSET {
                 8 => 1,                     // One screen.
@@ -339,7 +352,9 @@ impl VirtioGpu {
     pub fn write(&mut self, offset: u64, value: u32) -> bool {
         if offset < NOTIFY_OFFSET {
             if self.common.write(offset, value) {
+                let isr = self.isr();
                 *self = Self::new(self.width, self.height);
+                self.isr = isr;
             }
             return false;
         }
@@ -350,7 +365,7 @@ impl VirtioGpu {
     pub fn service(&mut self, memory: &dyn GuestMemory, backend: &mut dyn Backend) {
         match self.drain(memory, backend) {
             Ok(true) => {
-                self.common.signal_queue();
+                self.isr.fetch_or(ISR_QUEUE, Ordering::Relaxed);
                 self.irq_requested = true;
             }
             Ok(false) => {}

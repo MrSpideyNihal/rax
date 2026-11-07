@@ -4,9 +4,10 @@ use std::error::Error;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::Thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rax_host::virgl::Renderer;
@@ -29,7 +30,7 @@ use crate::serial::Sink;
 use crate::virtio_balloon::VirtioBalloon;
 use crate::virtio_blk::{GuestMemory, OutOfRange, VirtioBlk};
 use crate::virtio_gpu::{self, GpuStats, Scanout, VirtioGpu};
-use crate::virtio_input::VirtioInput;
+use crate::virtio_input::{ISR_OFFSET, NOTIFY_OFFSET, VirtioInput};
 use crate::virtio_net::VirtioNet;
 
 /// Printed by the guest once user space is running.
@@ -61,6 +62,8 @@ const HALT_POLL: Duration = Duration::from_millis(50);
 const RELEASE_WAIT: Duration = Duration::from_secs(5);
 /// Virtual CPUs given to the guest.
 const CPUS: u8 = 1;
+/// How long the render thread stays awake after finishing work.
+const RENDER_SPIN: Duration = Duration::from_micros(200);
 /// Console text kept for a running app, in bytes.
 const CONSOLE_KEEP: usize = 16 * 1024;
 
@@ -292,6 +295,8 @@ struct Shared {
     powered_off: Arc<AtomicBool>,
     /// When the configured run time ends.
     deadline: Instant,
+    /// The GPU, if there is one.
+    gpu: Option<GpuLink>,
 }
 
 /// Work for the thread that gives RAM back. Windows takes up to milliseconds
@@ -507,40 +512,146 @@ impl GuestMemory for RamView<'_, '_> {
     }
 }
 
-/// The GPU and everything tied to the thread that owns its OpenGL context.
-struct Gpu<'vm> {
-    device: VirtioGpu,
-    renderer: Renderer<'vm>,
-    pixels: Vec<u8>,
+/// What the vCPUs share with the render thread.
+struct GpuLink {
+    device: Mutex<VirtioGpu>,
+    /// The interrupt status, readable without the device lock.
+    isr: Arc<AtomicU8>,
+    /// Set when the guest has queued work.
+    notified: AtomicBool,
+    /// The render thread, once it is running.
+    render_thread: OnceLock<Thread>,
+    /// The last frame, for a screenshot once the guest has stopped.
+    last_frame: Mutex<Option<(Scanout, Vec<u8>)>>,
 }
 
-impl Gpu<'_> {
-    /// Reads what is on screen into `pixels`, as BGRX.
-    fn read_screen(&mut self) -> Option<Scanout> {
-        let started = Instant::now();
-        let shown = self.copy_screen();
-        self.device.record_present(started.elapsed());
-        shown
+impl GpuLink {
+    fn new(device: VirtioGpu) -> Self {
+        Self {
+            isr: device.isr(),
+            device: Mutex::new(device),
+            notified: AtomicBool::new(false),
+            render_thread: OnceLock::new(),
+            last_frame: Mutex::new(None),
+        }
     }
 
-    fn copy_screen(&mut self) -> Option<Scanout> {
-        let screen = self.device.scanout()?;
-        let bytes = screen.width as usize * screen.height as usize * 4;
-        self.pixels.resize(bytes, 0);
-        self.renderer.prepare();
-        let code = self.renderer.read_pixels(
-            screen.resource,
-            screen.width,
-            screen.height,
-            &mut self.pixels,
-        );
-        if code != 0 {
-            return None;
+    fn notify(&self) {
+        self.notified.store(true, Ordering::Release);
+        if let Some(thread) = self.render_thread.get() {
+            thread.unpark();
         }
-        if screen.swap_red_blue {
-            virtio_gpu::swap_red_blue(&mut self.pixels);
+    }
+}
+
+/// Reads what is on screen, as BGRX.
+fn read_screen(
+    link: &GpuLink,
+    renderer: &mut Renderer<'_>,
+    pixels: &mut Vec<u8>,
+) -> Option<Scanout> {
+    let started = Instant::now();
+    let screen = link.device.lock().ok()?.scanout()?;
+    let bytes = screen.width as usize * screen.height as usize * 4;
+    pixels.resize(bytes, 0);
+    renderer.prepare();
+    let code = renderer.read_pixels(screen.resource, screen.width, screen.height, pixels);
+    if code != 0 {
+        return None;
+    }
+    if screen.swap_red_blue {
+        virtio_gpu::swap_red_blue(pixels);
+    }
+    if let Ok(mut device) = link.device.lock() {
+        device.record_present(started.elapsed());
+    }
+    Some(screen)
+}
+
+/// Runs the queues once, and tells the guest if anything finished.
+fn render_once(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    link: &GpuLink,
+    renderer: &mut Renderer<'_>,
+    kicker: &Kicker<'_>,
+    interrupter: &Interrupter<'_>,
+) -> Result<(), &'static str> {
+    let mut device = link.device.lock().map_err(|_| "GPU lock poisoned")?;
+    device.service(&RamView(vm, shared), renderer);
+    let finished = device.take_irq();
+    drop(device);
+    if finished {
+        let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
+        bus.raise_gpu();
+        let pending = bus.pending_vector().is_some();
+        let interrupts = bus.take_interrupts();
+        drop(bus);
+        send_interrupts(interrupter, interrupts);
+        // Without an I/O APIC, the vCPU has to wake up to inject it.
+        if pending {
+            shared.wake.notify_all();
+            kicker.kick();
         }
-        Some(screen)
+    }
+    Ok(())
+}
+
+/// Owns the renderer, because an OpenGL context cannot change threads. The
+/// guest keeps running while this works, so a long draw no longer stops it.
+fn render_loop(
+    vm: &Vm<'_>,
+    shared: &Shared,
+    link: &GpuLink,
+    mut renderer: Renderer<'_>,
+    kicker: &Kicker<'_>,
+    interrupter: &Interrupter<'_>,
+) {
+    let mut pixels = Vec::new();
+    let mut last_frame = Instant::now();
+    let mut last_work = Instant::now();
+    while !shared.stop.load(Ordering::Relaxed) {
+        if link.notified.swap(false, Ordering::Acquire) {
+            if render_once(vm, shared, link, &mut renderer, kicker, interrupter).is_err() {
+                return;
+            }
+            last_work = Instant::now();
+            continue;
+        }
+        if last_frame.elapsed() >= FRAME_INTERVAL {
+            last_frame = Instant::now();
+            renderer.poll();
+            let waiting = link
+                .device
+                .lock()
+                .is_ok_and(|mut device| device.take_frame_waiting());
+            if waiting
+                && let Some(display) = &shared.display
+                && let Some(screen) = read_screen(link, &mut renderer, &mut pixels)
+                && let Ok(mut frame) = display.frame.lock()
+            {
+                let rows = shared.screen_height.max(1);
+                let columns = frame.len() / 4 / rows;
+                virtio_gpu::copy_scaled(
+                    &pixels,
+                    (screen.width, screen.height),
+                    &mut frame,
+                    (columns as u32, rows as u32),
+                );
+            }
+        }
+        // Stay awake briefly: the guest's next request usually follows at
+        // once, and it waits for this thread to wake.
+        if last_work.elapsed() < RENDER_SPIN {
+            std::hint::spin_loop();
+        } else {
+            std::thread::park_timeout(FRAME_INTERVAL);
+        }
+    }
+    if let Some(screen) = read_screen(link, &mut renderer, &mut pixels)
+        && let Ok(mut last) = link.last_frame.lock()
+    {
+        *last = Some((screen, pixels));
     }
 }
 
@@ -553,33 +664,10 @@ fn stored_register(register: u64, size: u8) -> u32 {
     }
 }
 
-/// Performs a guest store to GPU memory. The device lock is not held, so the
-/// timer keeps running during a long draw.
-fn gpu_store(
-    vm: &Vm<'_>,
-    shared: &Shared,
-    gpu: &mut Gpu<'_>,
-    offset: u64,
-    value: u32,
-) -> Result<(), Box<dyn Error>> {
-    if gpu.device.write(offset, value) {
-        gpu.device.service(&RamView(vm, shared), &mut gpu.renderer);
-        if gpu.device.take_irq() {
-            shared
-                .bus
-                .lock()
-                .map_err(|_| "device lock poisoned")?
-                .raise_gpu();
-        }
-    }
-    Ok(())
-}
-
 /// Performs a guest access to device memory.
 fn device_memory(
     vm: &Vm<'_>,
     shared: &Shared,
-    gpu: &mut Option<Gpu<'_>>,
     info: &ExitInfo,
     gpa: u64,
     bytes: &[u8],
@@ -587,17 +675,32 @@ fn device_memory(
     let access = mmio::decode(bytes)
         .ok_or_else(|| format!("cannot decode device access {bytes:02x?} at {gpa:#x}"))?;
     let mut bus = shared.bus.lock().map_err(|_| "device lock poisoned")?;
-    if let (Some(offset), Some(gpu)) = (bus.gpu_offset(gpa), gpu.as_mut()) {
+    if let (Some(offset), Some(link)) = (bus.gpu_offset(gpa), shared.gpu.as_ref()) {
         drop(bus);
         if access.write {
             let value = match access.immediate {
                 Some(value) => value,
                 None => stored_register(vm.general_register(access.register)?, access.size),
             };
-            gpu_store(vm, shared, gpu, offset, value)?;
+            // A notification must not wait for the draw in progress.
+            if offset == NOTIFY_OFFSET {
+                link.notify();
+            } else {
+                link.device
+                    .lock()
+                    .map_err(|_| "GPU lock poisoned")?
+                    .write(offset, value);
+            }
             vm.advance(info, access.length)?;
         } else {
-            let value = gpu.device.read(offset, access.size);
+            let value = if offset == ISR_OFFSET {
+                u32::from(link.isr.swap(0, Ordering::Relaxed))
+            } else {
+                link.device
+                    .lock()
+                    .map_err(|_| "GPU lock poisoned")?
+                    .read(offset, access.size)
+            };
             vm.finish_load(
                 info,
                 access.register,
@@ -656,7 +759,6 @@ fn delivery(pending: Option<u8>, interruptible: bool) -> Delivery {
 fn vcpu_loop(
     vm: &Vm<'_>,
     shared: &Shared,
-    gpu: &mut Option<Gpu<'_>>,
     interrupter: &Interrupter<'_>,
     deadline: Instant,
 ) -> Result<Finished, Box<dyn Error>> {
@@ -671,9 +773,6 @@ fn vcpu_loop(
         let frame_due = last_frame.elapsed() >= FRAME_INTERVAL;
         if frame_due {
             last_frame = Instant::now();
-            if let Some(gpu) = gpu.as_mut() {
-                gpu.renderer.poll();
-            }
         }
         if let Some(display) = &shared.display {
             if display.stop.load(Ordering::Relaxed) {
@@ -685,28 +784,11 @@ fn vcpu_loop(
                     window_exits,
                 });
             }
-            match gpu.as_mut() {
-                Some(gpu) if frame_due => {
-                    if gpu.device.take_frame_waiting()
-                        && let Some(screen) = gpu.read_screen()
-                        && let Ok(mut frame) = display.frame.lock()
-                    {
-                        let rows = shared.screen_height.max(1);
-                        let columns = frame.len() / 4 / rows;
-                        virtio_gpu::copy_scaled(
-                            &gpu.pixels,
-                            (screen.width, screen.height),
-                            &mut frame,
-                            (columns as u32, rows as u32),
-                        );
-                    }
-                }
-                None if frame_due => {
-                    if let Ok(mut frame) = display.frame.try_lock() {
-                        vm.read_framebuffer(&mut frame)?;
-                    }
-                }
-                _ => {}
+            if frame_due
+                && shared.gpu.is_none()
+                && let Ok(mut frame) = display.frame.try_lock()
+            {
+                vm.read_framebuffer(&mut frame)?;
             }
         }
         if shared.powered_off.load(Ordering::Relaxed) {
@@ -814,7 +896,7 @@ fn vcpu_loop(
                 .owns_memory(gpa) =>
             {
                 let bytes = &instruction[..usize::from(instruction_bytes)];
-                device_memory(vm, shared, gpu, &info, gpa, bytes)?;
+                device_memory(vm, shared, &info, gpa, bytes)?;
             }
             VmExit::Mmio {
                 gpa, write: false, ..
@@ -974,7 +1056,16 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         releases,
         powered_off,
         deadline,
+        gpu: config.gpu.as_ref().and(config.framebuffer).map(|screen| {
+            GpuLink::new(VirtioGpu::new(
+                u32::from(screen.width),
+                u32::from(screen.height),
+            ))
+        }),
     };
+    if config.gpu.is_some() && shared.gpu.is_none() {
+        return Err("a GPU needs a screen size".into());
+    }
     if config.apic {
         shared
             .bus
@@ -986,15 +1077,6 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let interrupter = vm.interrupter();
     let releaser = vm.ram_releaser();
     let input = config.shell.then(spawn_stdin_reader);
-    let mut gpu = match (&config.gpu, config.framebuffer) {
-        (Some(folder), Some(screen)) => Some(Gpu {
-            device: VirtioGpu::new(u32::from(screen.width), u32::from(screen.height)),
-            renderer: vm.start_renderer(folder)?,
-            pixels: Vec::new(),
-        }),
-        (Some(_), None) => return Err("a GPU needs a screen size".into()),
-        (None, _) => None,
-    };
 
     let finished = std::thread::scope(|scope| {
         let (timer_shared, timer_kicker, timer_interrupter) = (&shared, &kicker, &interrupter);
@@ -1008,7 +1090,29 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         });
         let (release_shared, release_handle) = (&shared, &releaser);
         scope.spawn(move || release_loop(release_shared, release_handle, &release_work));
-        let result = vcpu_loop(&vm, &shared, &mut gpu, &interrupter, deadline);
+        if let (Some(link), Some(folder)) = (&shared.gpu, &config.gpu) {
+            let (vm, shared, kicker, interrupter) = (&vm, &shared, &kicker, &interrupter);
+            let (started, outcome) = mpsc::channel();
+            let thread = scope.spawn(move || match vm.start_renderer(folder) {
+                Ok(renderer) => {
+                    let _ = started.send(Ok(()));
+                    render_loop(vm, shared, link, renderer, kicker, interrupter);
+                }
+                Err(error) => {
+                    let _ = started.send(Err(error.to_string()));
+                }
+            });
+            let _ = link.render_thread.set(thread.thread().clone());
+            let start = outcome
+                .recv()
+                .map_err(|_| String::from("the render thread stopped"))
+                .and_then(|result| result);
+            if let Err(error) = start {
+                shared.stop.store(true, Ordering::Relaxed);
+                return Err(error.into());
+            }
+        }
+        let result = vcpu_loop(&vm, &shared, &interrupter, deadline);
         shared.stop.store(true, Ordering::Relaxed);
         result
     })
@@ -1019,11 +1123,12 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
     let total_ms = started.elapsed().as_secs_f64() * 1e3;
     if let (Some(screen), Some(path)) = (config.framebuffer, &config.screenshot) {
         let mut pixels = vec![0_u8; screen.size_bytes()];
-        match gpu.as_mut() {
-            Some(gpu) => {
-                if let Some(shown) = gpu.read_screen() {
+        match &shared.gpu {
+            Some(link) => {
+                let last = link.last_frame.lock().map_err(|_| "GPU lock poisoned")?;
+                if let Some((shown, source)) = last.as_ref() {
                     virtio_gpu::copy_scaled(
-                        &gpu.pixels,
+                        source,
                         (shown.width, shown.height),
                         &mut pixels,
                         (u32::from(screen.width), u32::from(screen.height)),
@@ -1034,8 +1139,10 @@ pub fn run(config: Config) -> Result<Report, Box<dyn Error>> {
         }
         std::fs::write(path, screen.to_bmp(&pixels))?;
     }
-    let gpu_stats = gpu.as_ref().map(|gpu| gpu.device.stats());
-    drop(gpu);
+    let gpu_stats = match &shared.gpu {
+        Some(link) => Some(link.device.lock().map_err(|_| "GPU lock poisoned")?.stats()),
+        None => None,
+    };
     let boot_to_user_space_ms = ready
         .lock()
         .map_err(|_| "ready lock poisoned")?
