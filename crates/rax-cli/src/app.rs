@@ -75,6 +75,22 @@ const SESSION_CPUS: u8 = 4;
 /// The folder `scripts/fetch-gpu.ps1` fills.
 const GPU_FOLDER: &str = "gpu";
 const GPU_LIBRARY: &str = "libvirglrenderer-1.dll";
+/// The refresh rate Android is told its screen has. It paces frames to this,
+/// so at 60 the game stopped there with most of the machine idle.
+const REFRESH_HZ: u32 = 240;
+/// Typed into Android's console once it is up. Its 4.19 GPU driver copies each
+/// command batch into one continuous block, up to 256 KiB. Once memory
+/// fragments, that copy fails, the batch is lost, and a game waits forever for
+/// a query inside it. So this keeps memory free and regularly compacted. The
+/// marker file means typing it again does nothing, which is what lets RAX
+/// repeat it until the shell has really started.
+const MEMORY_TUNING: &[u8] = b"[ -e /dev/.rax ] || { : > /dev/.rax; \
+    echo 196608 > /proc/sys/vm/min_free_kbytes; \
+    (while true; do echo 1 > /proc/sys/vm/compact_memory; sleep 30; done) \
+    > /dev/null 2>&1 & }\n";
+/// How often that is typed, and how many times.
+const TUNING_INTERVAL: Duration = Duration::from_secs(15);
+const TUNING_TRIES: u32 = 6;
 /// How often the frame rate in the title bar updates.
 const TITLE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -86,6 +102,13 @@ fn android_cmdline(data_arg: &str, gpu: bool, apic: bool) -> String {
         LEGACY_INTERRUPTS
     };
     format!("{ANDROID_CMDLINE} {interrupts} {graphics} DATA={data_arg}")
+}
+
+/// Sets the screen's size and refresh rate on the kernel command line. The
+/// virtio GPU offers no way to report a rate, and only the kernel's built-in
+/// 60 Hz modes exist otherwise.
+fn screen_mode(width: u16, height: u16) -> String {
+    format!(" video=Virtual-1:{width}x{height}@{REFRESH_HZ}")
 }
 
 /// The renderer's folder, if this copy of RAX has one.
@@ -459,7 +482,11 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     config.gpu = gpu_folder(root);
     config.apic = true;
     config.cpus = SESSION_CPUS;
-    config.own_init_cmdline = Some(android_cmdline("vdb", config.gpu.is_some(), true));
+    let mut cmdline = android_cmdline("vdb", config.gpu.is_some(), true);
+    if config.gpu.is_some() {
+        cmdline.push_str(&screen_mode(width, height));
+    }
+    config.own_init_cmdline = Some(cmdline);
     config.network = Some(Network::start());
     config.touchscreen = true;
     config.display = Some(display.clone());
@@ -469,6 +496,8 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
     let mut last_title = Instant::now();
     let mut last_frames = 0;
     let mut tap = ConsoleTap::from_environment();
+    let session_started = Instant::now();
+    let mut tuning_sent = 0;
     let mut input = InputState::default();
     let mut install: Option<Install> = None;
     let profile = load_profile(root)?;
@@ -582,6 +611,13 @@ fn session(window: &mut Window, root: &Path, settings: Settings) -> Result<(), B
         }
         if let Some(tap) = tap.as_mut() {
             tap.pump(&display);
+        }
+        if tuning_sent < TUNING_TRIES
+            && session_started.elapsed() >= TUNING_INTERVAL * (tuning_sent + 1)
+            && let Ok(mut typed) = display.console_input.lock()
+        {
+            typed.extend_from_slice(MEMORY_TUNING);
+            tuning_sent += 1;
         }
         let finished = install.as_ref().and_then(|_| {
             let text = display.console_output.lock().ok()?;
@@ -790,6 +826,19 @@ mod tests {
         assert!(android_cmdline("vdb", false, true).contains("nomodeset HWACCEL=0"));
         let gpu = android_cmdline("vdb", true, true);
         assert!(!gpu.contains("nomodeset") && !gpu.contains("HWACCEL"));
+    }
+
+    #[test]
+    fn the_screen_mode_names_size_and_rate() {
+        assert_eq!(screen_mode(1280, 720), " video=Virtual-1:1280x720@240");
+    }
+
+    #[test]
+    fn memory_tuning_is_one_line_and_safe_to_repeat() {
+        let text = std::str::from_utf8(MEMORY_TUNING).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.ends_with('\n'));
+        assert!(text.starts_with("[ -e /dev/.rax ] ||"));
     }
 
     #[test]
