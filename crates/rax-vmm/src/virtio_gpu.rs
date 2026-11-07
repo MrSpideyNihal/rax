@@ -5,9 +5,10 @@
 //! forwarding, not passthrough. The device only unpacks requests, so it can
 //! be tested with a fake [`Backend`]. Everything from the guest is untrusted.
 //!
-//! Requests finish before the device answers, because the vCPU is stopped
-//! while it works. So a fence can be echoed at once: every later command
-//! already runs after the one it guards, on the same OpenGL stream.
+//! Requests run in order on one OpenGL stream, so a fence can be echoed at
+//! once: every later command already runs after the one it guards. But each
+//! command buffer must still be flushed to the GPU, because a query the guest
+//! is waiting on only finishes once its work has really been sent.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,6 +95,8 @@ pub trait Backend {
     fn detach_from_context(&mut self, context: u32, resource: u32);
     /// Runs a command buffer.
     fn submit(&mut self, context: u32, commands: &mut [u32]) -> i32;
+    /// Sends everything queued to the GPU.
+    fn flush(&mut self);
     /// Copies guest memory to the host.
     fn transfer_to_host(&mut self, transfer: Transfer) -> i32;
     /// Copies the host's copy to guest memory.
@@ -139,6 +142,9 @@ impl Backend for Renderer<'_> {
     }
     fn submit(&mut self, context: u32, commands: &mut [u32]) -> i32 {
         Renderer::submit(self, context, commands)
+    }
+    fn flush(&mut self) {
+        Renderer::flush(self);
     }
     fn transfer_to_host(&mut self, transfer: Transfer) -> i32 {
         Renderer::transfer_to_host(self, transfer)
@@ -564,7 +570,9 @@ impl VirtioGpu {
                 let mut commands: Vec<u32> =
                     words.iter().copied().map(u32::from_le_bytes).collect();
                 self.stats.submits += 1;
-                status(backend.submit(context, &mut commands))
+                let result = status(backend.submit(context, &mut commands));
+                backend.flush();
+                result
             }
             _ => None,
         }
@@ -736,6 +744,9 @@ mod tests {
         fn submit(&mut self, context: u32, commands: &mut [u32]) -> i32 {
             self.calls.push(format!("submit {context} {commands:?}"));
             self.result()
+        }
+        fn flush(&mut self) {
+            self.calls.push("flush".to_owned());
         }
         fn transfer_to_host(&mut self, transfer: Transfer) -> i32 {
             self.calls.push(format!("to host {transfer:?}"));
@@ -1049,6 +1060,16 @@ mod tests {
         assert_eq!(word(&out, 0), RESP_NODATA);
         assert_eq!(fake.calls[0], format!("submit 5 {:?}", [0xaa_u32, 0xbb]));
         assert_eq!(gpu.stats().submits, 1);
+    }
+
+    #[test]
+    fn every_command_buffer_is_flushed_to_the_gpu() {
+        // Regression test: without this, Minecraft polled query results about
+        // a million times, for answers stuck behind unsent work.
+        let (mut gpu, ram, mut fake) = (device(), Ram::new(0x8_0000), Fake::default());
+        let bytes = request(CMD_SUBMIT_3D, 5, &[4, 0, 0xaa]);
+        run(&mut gpu, &ram, &mut fake, 0, &bytes);
+        assert_eq!(fake.calls[1], "flush");
     }
 
     #[test]

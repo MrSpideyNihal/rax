@@ -555,6 +555,7 @@ type TransferWrite = unsafe extern "C" fn(
     u32,
 ) -> c_int;
 type NoArguments = unsafe extern "C" fn();
+type CreateFence = unsafe extern "C" fn(c_int, u32) -> c_int;
 type FillCaps = unsafe extern "C" fn(u32, u32, *mut c_void);
 
 /// The renderer's entry points.
@@ -572,6 +573,7 @@ struct Functions {
     transfer_write: TransferWrite,
     poll: NoArguments,
     force_context_zero: NoArguments,
+    create_fence: CreateFence,
     get_cap_set: GetCapSet,
     fill_caps: FillCaps,
     cleanup: Cleanup,
@@ -610,6 +612,7 @@ pub struct Renderer<'vm> {
     ram_bytes: usize,
     /// Lists the renderer holds pointers into until they are detached.
     backing: HashMap<u32, Vec<IoVec>>,
+    next_fence: u32,
     cookie: Box<u8>,
     _callbacks: Box<Callbacks>,
     _library: Library,
@@ -646,6 +649,7 @@ impl Renderer<'_> {
                     transfer_write: library.symbol(c"virgl_renderer_transfer_write_iov")?,
                     poll: library.symbol(c"virgl_renderer_poll")?,
                     force_context_zero: library.symbol(c"virgl_renderer_force_ctx_0")?,
+                    create_fence: library.symbol(c"virgl_renderer_create_fence")?,
                     get_cap_set: library.symbol(c"virgl_renderer_get_cap_set")?,
                     fill_caps: library.symbol(c"virgl_renderer_fill_caps")?,
                     cleanup: library.symbol(c"virgl_renderer_cleanup")?,
@@ -670,6 +674,7 @@ impl Renderer<'_> {
             ram,
             ram_bytes,
             backing: HashMap::new(),
+            next_fence: 0,
             cookie,
             _callbacks: callbacks,
             _library: library,
@@ -699,6 +704,16 @@ impl Renderer<'_> {
     pub fn prepare(&mut self) {
         // SAFETY: the renderer is running on its own thread.
         unsafe { (self.functions.force_context_zero)() }
+    }
+
+    /// Sends everything queued to the GPU, by creating a fence. Without
+    /// this the work can sit in the driver, and a guest waiting on a query
+    /// result asks again and again for an answer that isn't coming.
+    pub fn flush(&mut self) {
+        self.next_fence = self.next_fence.wrapping_add(1);
+        // SAFETY: the renderer is running on its own thread, and context zero
+        // is the one it always has.
+        unsafe { (self.functions.create_fence)(self.next_fence as c_int, 0) };
     }
 
     /// Lets the renderer finish queued work, such as query results.
